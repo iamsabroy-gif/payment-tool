@@ -33,6 +33,13 @@ from iso8583 import (
 )
 from samples import SAMPLES
 from tcp_transport import send_over_tcp, LENGTH_HEADERS
+from session_manager import (
+    connect_session,
+    disconnect_session,
+    get_status as session_status,
+    is_connected as session_is_connected,
+    send_on_session,
+)
 
 # ---------------------------------------------------------------------------
 # Config & globals
@@ -184,6 +191,8 @@ class ConnectionProfileIn(BaseModel):
     length_header: str = Field(default="2_byte")
     use_tls: bool = False
     timeout_sec: float = 10.0
+    auto_heartbeat: bool = False
+    heartbeat_interval_sec: int = 30
     description: Optional[str] = None
 
 
@@ -471,6 +480,8 @@ async def create_connection(body: ConnectionProfileIn, user=Depends(get_current_
         "length_header": body.length_header,
         "use_tls": body.use_tls,
         "timeout_sec": body.timeout_sec,
+        "auto_heartbeat": body.auto_heartbeat,
+        "heartbeat_interval_sec": body.heartbeat_interval_sec,
         "description": body.description or "",
         "created_at": now_iso(),
         "updated_at": now_iso(),
@@ -493,6 +504,8 @@ async def update_connection(conn_id: str, body: ConnectionProfileIn, user=Depend
             "length_header": body.length_header,
             "use_tls": body.use_tls,
             "timeout_sec": body.timeout_sec,
+            "auto_heartbeat": body.auto_heartbeat,
+            "heartbeat_interval_sec": body.heartbeat_interval_sec,
             "description": body.description or "",
             "updated_at": now_iso(),
         }},
@@ -505,10 +518,47 @@ async def update_connection(conn_id: str, body: ConnectionProfileIn, user=Depend
 
 @api.delete("/connections/{conn_id}")
 async def delete_connection(conn_id: str, user=Depends(get_current_user)):
+    # Make sure any live socket for this profile is torn down.
+    if session_is_connected(conn_id):
+        await disconnect_session(conn_id)
     res = await db.connection_profiles.delete_one({"id": conn_id, "user_id": user["id"]})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Connection profile not found")
     return {"ok": True}
+
+
+@api.post("/connections/{conn_id}/connect")
+async def connect_endpoint(conn_id: str, user=Depends(get_current_user)):
+    profile = await db.connection_profiles.find_one({"id": conn_id, "user_id": user["id"]}, {"_id": 0})
+    if not profile:
+        raise HTTPException(status_code=404, detail="Connection profile not found")
+    try:
+        sess = await connect_session(profile)
+    except (asyncio.TimeoutError, TimeoutError):
+        raise HTTPException(status_code=504, detail=f"Timeout contacting {profile['host']}:{profile['port']}")
+    except (ConnectionRefusedError, OSError) as e:
+        raise HTTPException(status_code=502, detail=f"Connection failed: {e}")
+    except Exception as e:
+        logger.exception("connect_session failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    return sess.public_status()
+
+
+@api.post("/connections/{conn_id}/disconnect")
+async def disconnect_endpoint(conn_id: str, user=Depends(get_current_user)):
+    profile = await db.connection_profiles.find_one({"id": conn_id, "user_id": user["id"]}, {"_id": 0})
+    if not profile:
+        raise HTTPException(status_code=404, detail="Connection profile not found")
+    ok = await disconnect_session(conn_id)
+    return {"ok": ok, "state": "idle"}
+
+
+@api.get("/connections/{conn_id}/status")
+async def connection_status(conn_id: str, user=Depends(get_current_user)):
+    profile = await db.connection_profiles.find_one({"id": conn_id, "user_id": user["id"]}, {"_id": 0})
+    if not profile:
+        raise HTTPException(status_code=404, detail="Connection profile not found")
+    return await session_status(conn_id)
 
 
 @api.post("/iso/send-tcp")
@@ -524,6 +574,7 @@ async def send_over_tcp_endpoint(body: TcpSendRequest, user=Depends(get_current_
     use_tls = bool(body.use_tls) if body.use_tls is not None else False
     timeout_sec = float(body.timeout_sec) if body.timeout_sec else 10.0
     conn_name = None
+    use_persistent = False
     if body.connection_id:
         conn = await db.connection_profiles.find_one(
             {"id": body.connection_id, "user_id": user["id"]}, {"_id": 0}
@@ -536,6 +587,13 @@ async def send_over_tcp_endpoint(body: TcpSendRequest, user=Depends(get_current_
         use_tls = bool(conn.get("use_tls"))
         timeout_sec = float(conn.get("timeout_sec") or 10.0)
         conn_name = conn["name"]
+        # Require an active session — don't silently open a one-off socket.
+        if not session_is_connected(body.connection_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Connection is not active. Open it from the Connections page before sending.",
+            )
+        use_persistent = True
 
     if not host or not port:
         raise HTTPException(status_code=400, detail="host and port are required")
@@ -566,17 +624,20 @@ async def send_over_tcp_endpoint(body: TcpSendRequest, user=Depends(get_current_
         "connection_name": conn_name,
     }
 
-    # Fire the socket
+    # Fire the socket (persistent session for saved profiles, one-off for ad-hoc)
     try:
         body_bytes = bytes.fromhex(req_hex)
-        framed, response_bytes = await send_over_tcp(
-            host=host,
-            port=port,
-            body=body_bytes,
-            length_header=length_header,
-            use_tls=use_tls,
-            timeout=timeout_sec,
-        )
+        if use_persistent:
+            framed, response_bytes = await send_on_session(body.connection_id, body_bytes)
+        else:
+            framed, response_bytes = await send_over_tcp(
+                host=host,
+                port=port,
+                body=body_bytes,
+                length_header=length_header,
+                use_tls=use_tls,
+                timeout=timeout_sec,
+            )
         resp_hex = response_bytes.hex().upper()
         # Attempt to decode if response looks like ASCII ISO-8583
         try:

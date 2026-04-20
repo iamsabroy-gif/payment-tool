@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams, Link } from "react-router-dom";
 import { api, apiErr } from "../lib/api";
 import { toast } from "sonner";
 import { FloppyDisk, PaperPlaneTilt, ArrowsClockwise, CheckCircle, XCircle } from "@phosphor-icons/react";
@@ -32,11 +32,36 @@ export default function Builder() {
     const [result, setResult] = useState(null);
     const [target, setTarget] = useState("simulator"); // 'simulator' | connection id
     const [connections, setConnections] = useState([]);
+    const [connStatuses, setConnStatuses] = useState({}); // {id: {state}}
 
     useEffect(() => {
         api.get("/specs").then((r) => setSpecs(r.data));
         api.get("/connections").then((r) => setConnections(r.data)).catch(() => {});
     }, []);
+
+    // Poll connection statuses every 5s while on the page
+    useEffect(() => {
+        if (connections.length === 0) return;
+        const refresh = async () => {
+            const results = await Promise.all(
+                connections.map((c) =>
+                    api.get(`/connections/${c.id}/status`).then((r) => [c.id, r.data]).catch(() => [c.id, { state: "idle" }])
+                )
+            );
+            setConnStatuses((prev) => {
+                const next = { ...prev };
+                results.forEach(([id, s]) => { next[id] = s; });
+                return next;
+            });
+        };
+        refresh();
+        const t = setInterval(refresh, 5000);
+        return () => clearInterval(t);
+    }, [connections]);
+
+    const selectedConnection = target === "simulator" ? null : connections.find((c) => c.id === target);
+    const selectedConnectionLive = selectedConnection ? connStatuses[selectedConnection.id]?.state === "connected" : false;
+    const canSend = target === "simulator" || selectedConnectionLive;
 
     useEffect(() => {
         api.get(`/specs/${networkId}/fields`).then((r) => setFields(r.data.fields));
@@ -214,7 +239,13 @@ export default function Builder() {
                     <button data-testid="preview-btn" onClick={doPreview} className="h-9 px-4 border border-gray-300 text-sm hover:bg-gray-50 flex items-center gap-2">
                         <ArrowsClockwise size={14} /> Preview
                     </button>
-                    <button data-testid="send-transaction-btn" onClick={doSend} disabled={sending} className="h-9 px-4 bg-[#002FA7] text-white text-sm flex items-center gap-2 hover:bg-[#002080] disabled:opacity-50">
+                    <button
+                        data-testid="send-transaction-btn"
+                        onClick={doSend}
+                        disabled={sending || !canSend}
+                        title={!canSend ? "Target connection is not active. Connect it from the Connections page first." : ""}
+                        className="h-9 px-4 bg-[#002FA7] text-white text-sm flex items-center gap-2 hover:bg-[#002080] disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
                         <PaperPlaneTilt size={14} /> {sending ? "Sending…" : "Send transaction"}
                     </button>
                 </div>
@@ -269,26 +300,39 @@ export default function Builder() {
                         onChange={(e) => setTarget(e.target.value)}
                         className="mt-2 w-full h-9 border border-gray-300 px-2 text-sm bg-white"
                     >
-                        <option value="simulator">Built-in simulator</option>
+                        <option value="simulator">Built-in simulator (dev)</option>
                         {connections.length > 0 && (
                             <optgroup label="TCP / CBS endpoints">
-                                {connections.map((c) => (
-                                    <option key={c.id} value={c.id}>
-                                        {c.name} · {c.host}:{c.port}
-                                    </option>
-                                ))}
+                                {connections.map((c) => {
+                                    const live = connStatuses[c.id]?.state === "connected";
+                                    return (
+                                        <option key={c.id} value={c.id}>
+                                            {live ? "● " : "○ "}{c.name} · {c.host}:{c.port}
+                                        </option>
+                                    );
+                                })}
                             </optgroup>
                         )}
                     </select>
-                    {target !== "simulator" && (() => {
-                        const c = connections.find((x) => x.id === target);
-                        if (!c) return null;
-                        return (
-                            <div className="mt-2 text-[10px] font-mono text-[#4B5563]">
-                                {c.use_tls ? "TLS" : "TCP"} · {c.length_header} · {c.timeout_sec}s
-                            </div>
-                        );
-                    })()}
+                    {selectedConnection && (
+                        <div className="mt-2 text-[11px] flex items-center gap-2" data-testid="target-status">
+                            <span className={`inline-block w-2 h-2 rounded-full ${selectedConnectionLive ? "bg-[#16A34A] animate-pulse" : "bg-[#9CA3AF]"}`} />
+                            <span className={selectedConnectionLive ? "text-[#16A34A]" : "text-[#4B5563]"}>
+                                {selectedConnectionLive ? "Connected" : "Not connected"}
+                            </span>
+                            <span className="font-mono text-[10px] text-[#4B5563]">· {selectedConnection.length_header}</span>
+                            {!selectedConnectionLive && (
+                                <Link to="/app/connections" className="ml-auto text-[#002FA7] hover:underline text-[11px]" data-testid="target-open-connections">
+                                    Open →
+                                </Link>
+                            )}
+                        </div>
+                    )}
+                    {target === "simulator" && (
+                        <div className="mt-2 text-[11px] text-[#4B5563]">
+                            In-process mock host — safe for dev / exploration.
+                        </div>
+                    )}
                 </div>
                 <form onSubmit={doSave} className="bg-white p-4 col-span-12 md:col-span-4 flex gap-2 items-end">
                     <div className="flex-1">
