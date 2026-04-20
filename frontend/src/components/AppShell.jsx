@@ -8,6 +8,7 @@ import {
     CreditCard,
     SignOut,
     Lightning,
+    Plug,
 } from "@phosphor-icons/react";
 
 const NAV = [
@@ -15,6 +16,7 @@ const NAV = [
     { to: "/app/builder", label: "Builder", icon: Wrench, testid: "nav-builder" },
     { to: "/app/templates", label: "Templates", icon: BookBookmark, testid: "nav-templates" },
     { to: "/app/logs", label: "Logs", icon: ListDashes, testid: "nav-logs" },
+    { to: "/app/connections", label: "Connections", icon: Plug, testid: "nav-connections" },
     { to: "/app/pricing", label: "Billing", icon: CreditCard, testid: "nav-pricing" },
 ];
 

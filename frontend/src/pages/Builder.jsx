@@ -30,29 +30,45 @@ export default function Builder() {
     const [sending, setSending] = useState(false);
     const [saveName, setSaveName] = useState("");
     const [result, setResult] = useState(null);
+    const [target, setTarget] = useState("simulator"); // 'simulator' | connection id
+    const [connections, setConnections] = useState([]);
 
     useEffect(() => {
         api.get("/specs").then((r) => setSpecs(r.data));
+        api.get("/connections").then((r) => setConnections(r.data)).catch(() => {});
     }, []);
 
     useEffect(() => {
         api.get(`/specs/${networkId}/fields`).then((r) => setFields(r.data.fields));
     }, [networkId]);
 
-    // Preload template if ?template=id
+    // Preload template if ?template=id, or sample if ?sample=id
     useEffect(() => {
         const tid = searchParams.get("template");
-        if (!tid) return;
-        api.get("/templates").then((r) => {
-            const t = r.data.find((x) => x.id === tid);
-            if (!t) return;
-            setNetworkId(t.network_id);
-            setMti(t.mti);
-            const keys = Object.keys(t.data_elements || {}).map(Number);
-            setActive(new Set(keys));
-            setValues(t.data_elements || {});
-            toast.success(`Loaded template "${t.name}"`);
-        });
+        const sid = searchParams.get("sample");
+        if (tid) {
+            api.get("/templates").then((r) => {
+                const t = r.data.find((x) => x.id === tid);
+                if (!t) return;
+                setNetworkId(t.network_id);
+                setMti(t.mti);
+                const keys = Object.keys(t.data_elements || {}).map(Number);
+                setActive(new Set(keys));
+                setValues(t.data_elements || {});
+                toast.success(`Loaded template "${t.name}"`);
+            });
+        } else if (sid) {
+            api.get("/samples").then((r) => {
+                const s = r.data.find((x) => x.id === sid);
+                if (!s) return;
+                setNetworkId(s.network_id);
+                setMti(s.mti);
+                const keys = Object.keys(s.data_elements || {}).map(Number);
+                setActive(new Set(keys));
+                setValues(s.data_elements || {});
+                toast.success(`Loaded sample "${s.name}"`);
+            });
+        }
     }, [searchParams]);
 
     const fieldMap = useMemo(() => {
@@ -104,13 +120,29 @@ export default function Builder() {
         setSending(true);
         setResult(null);
         try {
-            const { data } = await api.post("/iso/send", {
-                mti,
-                network_id: networkId,
-                data_elements: buildDeMap(),
-            });
+            let data;
+            if (target === "simulator") {
+                const resp = await api.post("/iso/send", {
+                    mti,
+                    network_id: networkId,
+                    data_elements: buildDeMap(),
+                });
+                data = resp.data;
+            } else {
+                const resp = await api.post("/iso/send-tcp", {
+                    connection_id: target,
+                    mti,
+                    network_id: networkId,
+                    data_elements: buildDeMap(),
+                });
+                data = resp.data;
+            }
             setResult(data);
-            toast.success(`Response ${data.response_code} · ${data.response_description}`);
+            if (data.error) {
+                toast.error(`Network error · ${data.error}`);
+            } else {
+                toast.success(`Response ${data.response_code} · ${data.response_description}`);
+            }
         } catch (e) {
             toast.error(apiErr(e));
         } finally {
@@ -188,7 +220,7 @@ export default function Builder() {
                 </div>
             </header>
 
-            {/* Header row: network + MTI + save */}
+            {/* Header row: network + MTI + target + save */}
             <section className="grid grid-cols-12 gap-px bg-[#E5E7EB] border border-[#E5E7EB]">
                 <div className="bg-white p-4 col-span-12 md:col-span-3">
                     <label className="text-[10px] uppercase tracking-widest text-[#4B5563]">Network Spec</label>
@@ -203,7 +235,7 @@ export default function Builder() {
                         ))}
                     </select>
                 </div>
-                <div className="bg-white p-4 col-span-12 md:col-span-3">
+                <div className="bg-white p-4 col-span-12 md:col-span-2">
                     <label className="text-[10px] uppercase tracking-widest text-[#4B5563]">MTI (4 digits)</label>
                     <input
                         data-testid="mti-input"
@@ -229,7 +261,36 @@ export default function Builder() {
                         ))}
                     </div>
                 </div>
-                <form onSubmit={doSave} className="bg-white p-4 col-span-12 md:col-span-6 flex gap-2 items-end">
+                <div className="bg-white p-4 col-span-12 md:col-span-3">
+                    <label className="text-[10px] uppercase tracking-widest text-[#4B5563]">Send to</label>
+                    <select
+                        data-testid="target-select"
+                        value={target}
+                        onChange={(e) => setTarget(e.target.value)}
+                        className="mt-2 w-full h-9 border border-gray-300 px-2 text-sm bg-white"
+                    >
+                        <option value="simulator">Built-in simulator</option>
+                        {connections.length > 0 && (
+                            <optgroup label="TCP / CBS endpoints">
+                                {connections.map((c) => (
+                                    <option key={c.id} value={c.id}>
+                                        {c.name} · {c.host}:{c.port}
+                                    </option>
+                                ))}
+                            </optgroup>
+                        )}
+                    </select>
+                    {target !== "simulator" && (() => {
+                        const c = connections.find((x) => x.id === target);
+                        if (!c) return null;
+                        return (
+                            <div className="mt-2 text-[10px] font-mono text-[#4B5563]">
+                                {c.use_tls ? "TLS" : "TCP"} · {c.length_header} · {c.timeout_sec}s
+                            </div>
+                        );
+                    })()}
+                </div>
+                <form onSubmit={doSave} className="bg-white p-4 col-span-12 md:col-span-4 flex gap-2 items-end">
                     <div className="flex-1">
                         <label className="text-[10px] uppercase tracking-widest text-[#4B5563]">Save as template</label>
                         <input

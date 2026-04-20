@@ -13,6 +13,7 @@ import Templates from "./pages/Templates";
 import Logs from "./pages/Logs";
 import Pricing from "./pages/Pricing";
 import CheckoutReturn from "./pages/CheckoutReturn";
+import Connections from "./pages/Connections";
 
 function PublicOnly({ children }) {
     const { user, loading } = useAuth();
@@ -44,6 +45,7 @@ function App() {
                             <Route path="builder" element={<Builder />} />
                             <Route path="templates" element={<Templates />} />
                             <Route path="logs" element={<Logs />} />
+                            <Route path="connections" element={<Connections />} />
                             <Route path="pricing" element={<Pricing />} />
                         </Route>
                         <Route path="*" element={<Navigate to="/" replace />} />

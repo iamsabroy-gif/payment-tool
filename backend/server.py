@@ -5,6 +5,7 @@ load_dotenv(ROOT_DIR / '.env')
 
 import os
 import uuid
+import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict
@@ -24,11 +25,14 @@ from emergentintegrations.payments.stripe.checkout import (
 from iso8583 import (
     NETWORK_SPECS,
     encode_message,
+    decode_message,
     hex_to_base64,
     simulate_response,
     field_catalog,
     RESPONSE_CODES,
 )
+from samples import SAMPLES
+from tcp_transport import send_over_tcp, LENGTH_HEADERS
 
 # ---------------------------------------------------------------------------
 # Config & globals
@@ -171,6 +175,30 @@ class SendTransactionRequest(BaseModel):
 
 class CheckoutRequest(BaseModel):
     origin_url: str
+
+
+class ConnectionProfileIn(BaseModel):
+    name: str
+    host: str
+    port: int = Field(ge=1, le=65535)
+    length_header: str = Field(default="2_byte")
+    use_tls: bool = False
+    timeout_sec: float = 10.0
+    description: Optional[str] = None
+
+
+class TcpSendRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    connection_id: Optional[str] = None
+    # ad-hoc override (take precedence if no connection_id)
+    host: Optional[str] = None
+    port: Optional[int] = None
+    length_header: Optional[str] = None
+    use_tls: Optional[bool] = None
+    timeout_sec: Optional[float] = None
+    mti: str
+    network_id: str = "visa"
+    data_elements: Dict[str, str]
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +447,238 @@ async def simulate(body: SendTransactionRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"raw_hex": resp_hex, "parsed": resp_meta, "response_code": resp_meta.get("response_code")}
+
+
+# ---------------------------------------------------------------------------
+# Connection profiles (CBS / switch TCP endpoints)
+# ---------------------------------------------------------------------------
+@api.get("/connections")
+async def list_connections(user=Depends(get_current_user)):
+    docs = await db.connection_profiles.find({"user_id": user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return docs
+
+
+@api.post("/connections")
+async def create_connection(body: ConnectionProfileIn, user=Depends(get_current_user)):
+    if body.length_header not in LENGTH_HEADERS:
+        raise HTTPException(status_code=400, detail=f"length_header must be one of {LENGTH_HEADERS}")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": user["id"],
+        "name": body.name,
+        "host": body.host.strip(),
+        "port": body.port,
+        "length_header": body.length_header,
+        "use_tls": body.use_tls,
+        "timeout_sec": body.timeout_sec,
+        "description": body.description or "",
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    await db.connection_profiles.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api.put("/connections/{conn_id}")
+async def update_connection(conn_id: str, body: ConnectionProfileIn, user=Depends(get_current_user)):
+    if body.length_header not in LENGTH_HEADERS:
+        raise HTTPException(status_code=400, detail=f"length_header must be one of {LENGTH_HEADERS}")
+    res = await db.connection_profiles.update_one(
+        {"id": conn_id, "user_id": user["id"]},
+        {"$set": {
+            "name": body.name,
+            "host": body.host.strip(),
+            "port": body.port,
+            "length_header": body.length_header,
+            "use_tls": body.use_tls,
+            "timeout_sec": body.timeout_sec,
+            "description": body.description or "",
+            "updated_at": now_iso(),
+        }},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Connection profile not found")
+    doc = await db.connection_profiles.find_one({"id": conn_id}, {"_id": 0})
+    return doc
+
+
+@api.delete("/connections/{conn_id}")
+async def delete_connection(conn_id: str, user=Depends(get_current_user)):
+    res = await db.connection_profiles.delete_one({"id": conn_id, "user_id": user["id"]})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Connection profile not found")
+    return {"ok": True}
+
+
+@api.post("/iso/send-tcp")
+async def send_over_tcp_endpoint(body: TcpSendRequest, user=Depends(get_current_user)):
+    """Encode an ISO-8583 message and send it over TCP (optionally TLS) to a
+    user-configured CBS host. Request & response are both persisted as logs."""
+    await enforce_log_quota(user)
+
+    # Resolve connection settings
+    host = body.host
+    port = body.port
+    length_header = body.length_header or "2_byte"
+    use_tls = bool(body.use_tls) if body.use_tls is not None else False
+    timeout_sec = float(body.timeout_sec) if body.timeout_sec else 10.0
+    conn_name = None
+    if body.connection_id:
+        conn = await db.connection_profiles.find_one(
+            {"id": body.connection_id, "user_id": user["id"]}, {"_id": 0}
+        )
+        if not conn:
+            raise HTTPException(status_code=404, detail="Connection profile not found")
+        host = conn["host"]
+        port = conn["port"]
+        length_header = conn["length_header"]
+        use_tls = bool(conn.get("use_tls"))
+        timeout_sec = float(conn.get("timeout_sec") or 10.0)
+        conn_name = conn["name"]
+
+    if not host or not port:
+        raise HTTPException(status_code=400, detail="host and port are required")
+    if length_header not in LENGTH_HEADERS:
+        raise HTTPException(status_code=400, detail=f"length_header must be one of {LENGTH_HEADERS}")
+
+    try:
+        req_hex, req_meta = encode_message(body.mti, body.data_elements, body.network_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    outbound_id = str(uuid.uuid4())
+    endpoint_label = f"tcp{'s' if use_tls else ''}://{host}:{port} [{length_header}]"
+    outbound_log = {
+        "id": outbound_id,
+        "user_id": user["id"],
+        "timestamp": now_iso(),
+        "direction": "outbound",
+        "network_id": body.network_id,
+        "mti": body.mti,
+        "raw_hex": req_hex,
+        "raw_base64": hex_to_base64(req_hex),
+        "parsed": req_meta,
+        "status_code": None,
+        "related_id": None,
+        "endpoint_url": endpoint_label,
+        "connection_id": body.connection_id,
+        "connection_name": conn_name,
+    }
+
+    # Fire the socket
+    try:
+        body_bytes = bytes.fromhex(req_hex)
+        framed, response_bytes = await send_over_tcp(
+            host=host,
+            port=port,
+            body=body_bytes,
+            length_header=length_header,
+            use_tls=use_tls,
+            timeout=timeout_sec,
+        )
+        resp_hex = response_bytes.hex().upper()
+        # Attempt to decode if response looks like ASCII ISO-8583
+        try:
+            resp_meta = decode_message(resp_hex, body.network_id)
+            rc = "??"
+            for fobj in resp_meta.get("fields", []):
+                if fobj["field"] == 39:
+                    rc = str(fobj["value"]).strip() or "??"
+                    break
+            resp_meta["response_code"] = rc
+            resp_meta["response_code_description"] = RESPONSE_CODES.get(rc, "Unknown")
+        except Exception as dec_err:
+            resp_meta = {"error": f"decode failed: {dec_err}", "raw_ascii": response_bytes.decode("latin-1", errors="replace")}
+            rc = "??"
+        tcp_error = None
+    except (asyncio.TimeoutError, TimeoutError) as e:
+        resp_hex = ""
+        resp_meta = {"error": f"timeout after {timeout_sec}s contacting {host}:{port}"}
+        rc = "91"  # Issuer unavailable — closest standard code for timeout
+        tcp_error = str(e) or "timeout"
+    except (ConnectionRefusedError, OSError) as e:
+        resp_hex = ""
+        resp_meta = {"error": f"connection failed: {e}"}
+        rc = "96"  # System malfunction
+        tcp_error = str(e)
+    except Exception as e:
+        logger.exception("TCP send failed: %s", e)
+        resp_hex = ""
+        resp_meta = {"error": str(e)}
+        rc = "96"
+        tcp_error = str(e)
+
+    inbound_id = str(uuid.uuid4())
+    inbound_log = {
+        "id": inbound_id,
+        "user_id": user["id"],
+        "timestamp": now_iso(),
+        "direction": "inbound",
+        "network_id": body.network_id,
+        "mti": resp_meta.get("mti") if isinstance(resp_meta, dict) else body.mti,
+        "raw_hex": resp_hex,
+        "raw_base64": hex_to_base64(resp_hex) if resp_hex else "",
+        "parsed": resp_meta,
+        "status_code": rc,
+        "related_id": outbound_id,
+        "endpoint_url": endpoint_label,
+        "connection_id": body.connection_id,
+        "connection_name": conn_name,
+        "error": tcp_error,
+    }
+    outbound_log["related_id"] = inbound_id
+    outbound_log["status_code"] = rc
+
+    await db.transaction_logs.insert_many([outbound_log, inbound_log])
+    for doc in (outbound_log, inbound_log):
+        doc.pop("_id", None)
+
+    return {
+        "outbound": outbound_log,
+        "inbound": inbound_log,
+        "response_code": rc,
+        "response_description": RESPONSE_CODES.get(rc, "Unknown"),
+        "error": tcp_error,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Sample template library (read-only)
+# ---------------------------------------------------------------------------
+@api.get("/samples")
+async def list_samples():
+    return SAMPLES
+
+
+@api.post("/samples/{sample_id}/clone")
+async def clone_sample(sample_id: str, user=Depends(get_current_user)):
+    sample = next((s for s in SAMPLES if s["id"] == sample_id), None)
+    if not sample:
+        raise HTTPException(status_code=404, detail="Sample not found")
+    if user.get("plan") != "pro":
+        count = await db.templates.count_documents({"user_id": user["id"]})
+        if count >= 10:
+            raise HTTPException(
+                status_code=402,
+                detail="Free tier limited to 10 saved templates. Upgrade to Pro.",
+            )
+    doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": user["id"],
+        "name": sample["name"],
+        "network_id": sample["network_id"],
+        "mti": sample["mti"],
+        "data_elements": dict(sample["data_elements"]),
+        "description": sample.get("description", ""),
+        "cloned_from": sample["id"],
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    await db.templates.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
 
 
 # ---------------------------------------------------------------------------
@@ -707,6 +967,7 @@ async def on_startup():
     await db.transaction_logs.create_index([("user_id", 1), ("timestamp", -1)])
     await db.templates.create_index([("user_id", 1), ("created_at", -1)])
     await db.payment_transactions.create_index("session_id", unique=True)
+    await db.connection_profiles.create_index([("user_id", 1), ("created_at", -1)])
     await db.login_attempts.create_index("identifier")
     await seed_admin()
     await seed_specs()
