@@ -597,8 +597,15 @@ async def billing_status(session_id: str, request: Request, user=Depends(get_cur
     try:
         status = await stripe.get_checkout_status(session_id)
     except Exception as e:
-        logger.exception("Stripe status fetch failed: %s", e)
-        raise HTTPException(status_code=502, detail="Unable to reach Stripe")
+        logger.warning("Stripe status fetch failed (test mode?): %s", e)
+        # Graceful fallback: return pending so the poller keeps retrying / webhook catches up.
+        return {
+            "payment_status": existing.get("payment_status") or "pending",
+            "status": existing.get("status") or "open",
+            "amount_total": int(existing.get("amount", 0) * 100),
+            "currency": existing.get("currency", "usd"),
+            "note": "Live status temporarily unavailable; showing cached state.",
+        }
 
     await db.payment_transactions.update_one(
         {"session_id": session_id},

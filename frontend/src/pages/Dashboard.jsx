@@ -68,7 +68,7 @@ export default function Dashboard() {
                         <div className="text-[11px] uppercase tracking-widest text-[#4B5563]">Traffic · Last 7 days</div>
                         <div className="text-[11px] font-mono text-[#4B5563]">stacked outbound vs inbound</div>
                     </div>
-                    <div className="h-64">
+                    <div className="h-64 min-h-[220px]">
                         <ResponsiveContainer width="100%" height="100%">
                             <BarChart data={stats.volume_by_day || []} margin={{ top: 8, right: 8, left: -12, bottom: 0 }}>
                                 <CartesianGrid stroke="#F3F4F6" vertical={false} />
@@ -86,7 +86,7 @@ export default function Dashboard() {
                 </div>
                 <div className="bg-white p-5">
                     <div className="text-[11px] uppercase tracking-widest text-[#4B5563] mb-3">Auth outcomes</div>
-                    <div className="h-64">
+                    <div className="h-64 min-h-[220px]">
                         <ResponsiveContainer width="100%" height="100%">
                             <PieChart>
                                 <Pie data={donut} innerRadius={55} outerRadius={85} paddingAngle={0} dataKey="value">
