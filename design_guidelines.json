@@ -1,0 +1,100 @@
+{
+  "theme": "LIGHT",
+  "archetype": "4 (Swiss & High-Contrast)",
+  "design_philosophy": "Authority, clarity, and function-first. The UI must feel like a precision instrument for payment engineers. Color is used exclusively for function, guiding actions and highlighting data states. The density is high, layouts are hierarchical and heavily rely on grid systems. The aesthetic is 'Technical/Exposed Grid' with sharp edges.",
+  "colors": {
+    "background": {
+      "primary": "#FFFFFF",
+      "secondary": "#F3F4F6",
+      "tertiary": "#E5E7EB"
+    },
+    "text": {
+      "primary": "#111827",
+      "secondary": "#4B5563",
+      "tertiary": "#9CA3AF"
+    },
+    "accent": {
+      "primary": "#002FA7",
+      "primary_hover": "#002080",
+      "danger": "#E11D48",
+      "warning": "#EAB308",
+      "success": "#16A34A"
+    },
+    "border": {
+      "default": "#E5E7EB",
+      "active": "#002FA7"
+    }
+  },
+  "typography": {
+    "font_families": {
+      "heading": "IBM Plex Sans, sans-serif",
+      "body": "IBM Plex Sans, sans-serif",
+      "monospace": "JetBrains Mono, monospace"
+    },
+    "scales": {
+      "h1": "text-4xl tracking-tight font-semibold",
+      "h2": "text-2xl tracking-tight font-semibold",
+      "h3": "text-xl tracking-tight font-medium",
+      "h4": "text-lg tracking-tight font-medium",
+      "body": "text-sm leading-relaxed",
+      "small": "text-xs tracking-wide",
+      "code": "text-xs font-mono tracking-tight leading-relaxed"
+    }
+  },
+  "spacing_and_layout": {
+    "strategy": "The 'Control Room' Grid (For Dashboards / Analytics). Tight gaps (gap-4 or gap-6), every pixel utilized. High density for developer workflows.",
+    "container_padding": "p-6",
+    "surface_strategy": "Grid Borders (The 'Technical' Look). Expose the skeleton, make the grid visible with border-collapse and subtle borders. Avoid soft shadows, prefer 1px solid strokes.",
+    "border_radius": "rounded-none or rounded-sm (max 4px)",
+    "shadows": "Minimal. Use 1px borders for definition instead of large drop shadows."
+  },
+  "components": {
+    "buttons": {
+      "style": "Sharp edges (rounded-sm), high contrast. Primary: Klein Blue bg, White text. Secondary: Outline with border-gray-300.",
+      "states": "Hover must always change bg color and maintain contrast."
+    },
+    "inputs": {
+      "style": "1px solid border-gray-300, focus:ring-1 focus:ring-blue-600 focus:border-blue-600. Monospace font for hex/data entry.",
+      "density": "h-9 or h-8 for high-density forms."
+    },
+    "cards": {
+      "style": "Flat background (white), 1px subtle border, no shadow."
+    },
+    "iso_8583_builder": {
+      "mti_input": "Large, monospace, 4-character limited input.",
+      "bitmap_grid": "Ultra-dense grid layout (e.g., grid-cols-8 or grid-cols-16). Use small checkbox toggles or clickable numbered tiles (1-128). Active tiles highlighted in Primary Accent.",
+      "data_elements": "Rendered dynamically based on bitmap selection. Stacked compactly with labels and monospace inputs."
+    },
+    "log_viewer": {
+      "layout": "Split-pane view. Left: Raw Hex/Base64 (monospace, dark/grey background). Right: Parsed JSON/Table view (key-value pairs, syntax highlighted)."
+    }
+  },
+  "motion_and_interaction": {
+    "transitions": "Fast, precise (150ms ease-out). No bouncy or playful animations.",
+    "hover_states": "Crisp bg color shifts, border color darkening.",
+    "feedback": "Toast notifications for success/failure (bottom-right)."
+  },
+  "icons": {
+    "library": "@phosphor-icons/react",
+    "style": "Weight: 'regular' or 'bold' for high contrast.",
+    "installation": "yarn add @phosphor-icons/react"
+  },
+  "images_and_media": {
+    "hero_background": "https://images.unsplash.com/photo-1538029192284-570deb5a788f?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDk1Nzd8MHwxfHNlYXJjaHwyfHxkZXZlbG9wZXIlMjB0eXBpbmclMjBjb2RlJTIwYWJzdHJhY3R8ZW58MHx8fHwxNzc2NzE0MDYxfDA&ixlib=rb-4.1.0&q=85",
+    "credit_cards": "https://images.pexels.com/photos/164501/pexels-photo-164501.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+    "usage_instructions": "Use images sparingly as this is a technical dashboard. Hero image can be used for the landing/login page background with a heavy white overlay (bg-white/80) to maintain contrast."
+  },
+  "accessibility_and_testing": {
+    "contrast": "Ensure all text meets WCAG AA 4.5:1 ratio.",
+    "testing_attributes": "CRITICAL: All interactive and key informational elements MUST include a data-testid attribute (e.g., data-testid='send-transaction-btn')."
+  },
+  "instructions_to_main_agent": [
+    "Implement the landing/auth pages using the 'Control Room' grid philosophy but adapted for marketing.",
+    "Use Shadcn UI extensively for the dashboard, tables, and forms, but customize border radii to be sharp (rounded-sm) and remove large shadows.",
+    "For the ISO-8583 message builder, construct a 128-cell grid (Primary and Secondary bitmaps). Use an array of booleans/toggles.",
+    "For the Transaction Log Viewer, implement a split-pane interface. Consider using 'react-resizable-panels'.",
+    "Ensure all data entry fields in the ISO-8583 builder use a monospace font class (font-mono).",
+    "Stripe integration should have distinct Free/Pro tiers clearly marked.",
+    "Dashboard charts should use Recharts with colors mapped to the defined archetype (e.g., primary Klein Blue and Grey)."
+  ]
+}
