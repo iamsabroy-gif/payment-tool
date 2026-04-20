@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, apiErr } from "../lib/api";
 import { toast } from "sonner";
-import { Plug, Trash, PencilSimple, Plus, LockKey, LockKeyOpen } from "@phosphor-icons/react";
+import { Plug, Trash, PencilSimple, Plus, LockKey, LockKeyOpen, FloppyDisk } from "@phosphor-icons/react";
 
 const LENGTH_HEADERS = [
     { value: "2_byte", label: "2-byte big-endian", help: "Most common (ISO8583 over TCP)" },
@@ -123,63 +123,82 @@ export default function Connections() {
             )}
 
             {editing && (
-                <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50" onClick={close} data-testid="connection-modal">
-                    <form onClick={(e) => e.stopPropagation()} onSubmit={save} className="bg-white w-full max-w-lg border border-[#E5E7EB] p-6 space-y-4">
-                        <div>
+                <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4 overflow-y-auto" onClick={close} data-testid="connection-modal">
+                    <form
+                        onClick={(e) => e.stopPropagation()}
+                        onSubmit={save}
+                        className="bg-white w-full max-w-lg border border-[#E5E7EB] flex flex-col max-h-[92vh] shadow-xl"
+                    >
+                        <div className="px-6 py-5 border-b border-[#E5E7EB]">
                             <div className="text-[11px] uppercase tracking-widest text-[#002FA7]">Endpoint config</div>
                             <h2 className="text-xl font-semibold tracking-tight mt-1">
                                 {editing === "new" ? "New connection profile" : "Edit profile"}
                             </h2>
                         </div>
 
-                        <Field label="Name">
-                            <input data-testid="connection-name-input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required className="w-full h-9 border border-gray-300 px-2 text-sm focus:border-[#002FA7]" />
-                        </Field>
-                        <div className="grid grid-cols-3 gap-3">
-                            <div className="col-span-2">
-                                <Field label="Host (IP or DNS)">
-                                    <input data-testid="connection-host-input" value={form.host} onChange={(e) => setForm({ ...form, host: e.target.value })} placeholder="10.0.12.5" required className="w-full h-9 border border-gray-300 px-2 text-sm font-mono focus:border-[#002FA7]" />
+                        <div className="px-6 py-5 space-y-4 overflow-y-auto flex-1">
+                            <Field label="Name">
+                                <input data-testid="connection-name-input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required className="w-full h-9 border border-gray-300 px-2 text-sm focus:border-[#002FA7]" />
+                            </Field>
+                            <div className="grid grid-cols-3 gap-3">
+                                <div className="col-span-2">
+                                    <Field label="Host (IP or DNS)">
+                                        <input data-testid="connection-host-input" value={form.host} onChange={(e) => setForm({ ...form, host: e.target.value })} placeholder="10.0.12.5" required className="w-full h-9 border border-gray-300 px-2 text-sm font-mono focus:border-[#002FA7]" />
+                                    </Field>
+                                </div>
+                                <Field label="Port">
+                                    <input data-testid="connection-port-input" type="number" min={1} max={65535} value={form.port} onChange={(e) => setForm({ ...form, port: e.target.value })} required className="w-full h-9 border border-gray-300 px-2 text-sm font-mono focus:border-[#002FA7]" />
                                 </Field>
                             </div>
-                            <Field label="Port">
-                                <input data-testid="connection-port-input" type="number" min={1} max={65535} value={form.port} onChange={(e) => setForm({ ...form, port: e.target.value })} required className="w-full h-9 border border-gray-300 px-2 text-sm font-mono focus:border-[#002FA7]" />
-                            </Field>
-                        </div>
 
-                        <Field label="Length header framing">
-                            <div className="grid grid-cols-1 gap-1">
-                                {LENGTH_HEADERS.map((lh) => (
-                                    <label key={lh.value} className={`border px-3 py-2 cursor-pointer flex items-center gap-3 ${form.length_header === lh.value ? "border-[#002FA7] bg-[#F3F4F6]" : "border-gray-300"}`}>
-                                        <input type="radio" name="length_header" value={lh.value} checked={form.length_header === lh.value} onChange={() => setForm({ ...form, length_header: lh.value })} data-testid={`connection-lh-${lh.value}`} />
-                                        <div>
-                                            <div className="text-sm">{lh.label}</div>
-                                            <div className="text-[11px] text-[#4B5563]">{lh.help}</div>
-                                        </div>
-                                    </label>
-                                ))}
-                            </div>
-                        </Field>
-
-                        <div className="grid grid-cols-2 gap-3">
-                            <Field label="Timeout (sec)">
-                                <input data-testid="connection-timeout-input" type="number" min={1} max={120} value={form.timeout_sec} onChange={(e) => setForm({ ...form, timeout_sec: e.target.value })} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
-                            </Field>
-                            <label className="flex flex-col">
-                                <span className="text-[10px] uppercase tracking-widest text-[#4B5563]">TLS</span>
-                                <div className="mt-1 flex items-center gap-2 h-9 border border-gray-300 px-3">
-                                    <input data-testid="connection-tls-checkbox" type="checkbox" checked={form.use_tls} onChange={(e) => setForm({ ...form, use_tls: e.target.checked })} />
-                                    <span className="text-sm">{form.use_tls ? "Encrypted (TLS)" : "Plain TCP"}</span>
+                            <Field label="Length header framing">
+                                <div className="grid grid-cols-1 gap-1">
+                                    {LENGTH_HEADERS.map((lh) => (
+                                        <label key={lh.value} className={`border px-3 py-2 cursor-pointer flex items-center gap-3 transition-colors ${form.length_header === lh.value ? "border-[#002FA7] bg-[#F3F4F6]" : "border-gray-300 hover:bg-gray-50"}`}>
+                                            <input type="radio" name="length_header" value={lh.value} checked={form.length_header === lh.value} onChange={() => setForm({ ...form, length_header: lh.value })} data-testid={`connection-lh-${lh.value}`} />
+                                            <div>
+                                                <div className="text-sm">{lh.label}</div>
+                                                <div className="text-[11px] text-[#4B5563]">{lh.help}</div>
+                                            </div>
+                                        </label>
+                                    ))}
                                 </div>
-                            </label>
+                            </Field>
+
+                            <div className="grid grid-cols-2 gap-3">
+                                <Field label="Timeout (sec)">
+                                    <input data-testid="connection-timeout-input" type="number" min={1} max={120} value={form.timeout_sec} onChange={(e) => setForm({ ...form, timeout_sec: e.target.value })} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
+                                </Field>
+                                <label className="flex flex-col">
+                                    <span className="text-[10px] uppercase tracking-widest text-[#4B5563]">TLS</span>
+                                    <div className="mt-1 flex items-center gap-2 h-9 border border-gray-300 px-3">
+                                        <input data-testid="connection-tls-checkbox" type="checkbox" checked={form.use_tls} onChange={(e) => setForm({ ...form, use_tls: e.target.checked })} />
+                                        <span className="text-sm">{form.use_tls ? "Encrypted (TLS)" : "Plain TCP"}</span>
+                                    </div>
+                                </label>
+                            </div>
+
+                            <Field label="Description">
+                                <input data-testid="connection-desc-input" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} placeholder="e.g. UAT CBS · RuPay switch" className="w-full h-9 border border-gray-300 px-2 text-sm focus:border-[#002FA7]" />
+                            </Field>
                         </div>
 
-                        <Field label="Description">
-                            <input data-testid="connection-desc-input" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} placeholder="e.g. UAT CBS · RuPay switch" className="w-full h-9 border border-gray-300 px-2 text-sm focus:border-[#002FA7]" />
-                        </Field>
-
-                        <div className="flex gap-2 pt-2">
-                            <button type="button" onClick={close} className="flex-1 h-10 border border-gray-300 text-sm hover:bg-gray-50">Cancel</button>
-                            <button data-testid="connection-save-btn" disabled={saving} className="flex-1 h-10 bg-[#002FA7] text-white text-sm hover:bg-[#002080] disabled:opacity-50">
+                        <div className="px-6 py-4 border-t border-[#E5E7EB] bg-[#F9FAFB] flex gap-3 sticky bottom-0">
+                            <button
+                                type="button"
+                                onClick={close}
+                                data-testid="connection-cancel-btn"
+                                className="flex-1 h-11 border border-gray-300 bg-white text-sm font-medium text-[#4B5563] hover:bg-gray-50 hover:border-gray-400 transition-colors"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="submit"
+                                data-testid="connection-save-btn"
+                                disabled={saving}
+                                className="flex-[2] h-11 bg-[#002FA7] text-white text-sm font-semibold tracking-wide flex items-center justify-center gap-2 hover:bg-[#002080] active:bg-[#001A66] transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+                            >
+                                <FloppyDisk size={16} weight="bold" />
                                 {saving ? "Saving…" : editing === "new" ? "Create profile" : "Save changes"}
                             </button>
                         </div>
