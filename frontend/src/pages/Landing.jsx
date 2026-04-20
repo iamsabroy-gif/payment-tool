@@ -30,7 +30,7 @@ export default function Landing() {
                         </h1>
                         <p className="mt-6 max-w-xl text-base leading-relaxed text-[#4B5563]">
                             Compose authorization messages with bitmap-level control. Capture every byte on the wire.
-                            Re-run traffic against VISA, Mastercard and AMEX field catalogues — all from a single cockpit.
+                            Re-run traffic against VISA, Mastercard, AMEX and RuPay field catalogues — all from a single cockpit.
                         </p>
                         <div className="mt-8 flex gap-3">
                             <Link to="/register" data-testid="hero-cta-primary" className="h-10 px-5 flex items-center bg-[#002FA7] text-white hover:bg-[#002080] text-sm font-medium">
@@ -43,7 +43,7 @@ export default function Landing() {
                         <div className="mt-10 grid grid-cols-3 gap-6 max-w-lg text-xs">
                             <Stat value="128" label="Addressable data elements" />
                             <Stat value="1987" label="ISO-8583 revision" />
-                            <Stat value="3" label="Pre-loaded networks" />
+                            <Stat value="4" label="Pre-loaded networks" />
                         </div>
                     </div>
                     <div className="col-span-12 lg:col-span-5 border border-[#E5E7EB] bg-white p-5 font-mono text-[11px] leading-relaxed">
@@ -79,7 +79,7 @@ BITMAP     : 7234 4501 A8E0 8000
                         <Feature Icon={Wrench} title="Bitmap-level builder" body="Toggle fields 1–128 on a 16-column grid. Primary and secondary bitmaps recompute in real time." />
                         <Feature Icon={Code} title="Hex & parsed split-pane" body="Every captured message gets a raw hex pane and a decoded field-by-field JSON pane." />
                         <Feature Icon={ShieldCheck} title="Deterministic simulator" body="Built-in authorization host with realistic response codes — no network dependency to test." />
-                        <Feature Icon={CreditCard} title="Multi-network specs" body="VISA Base I, Mastercard CIS, AMEX GCAG profiles ship out of the box." />
+                        <Feature Icon={CreditCard} title="Multi-network specs" body="VISA Base I, Mastercard CIS, AMEX GCAG and RuPay (NPCI) profiles ship out of the box." />
                     </div>
                 </div>
             </section>

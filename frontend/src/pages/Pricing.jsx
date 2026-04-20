@@ -6,7 +6,7 @@ import { Check, CreditCard } from "@phosphor-icons/react";
 
 const FEATURES_FREE = [
     "ISO-8583 Message Builder (128 fields)",
-    "VISA, Mastercard, AMEX specs",
+    "VISA, Mastercard, AMEX and RuPay specs",
     "50 transaction logs",
     "10 saved templates",
     "Built-in simulator",

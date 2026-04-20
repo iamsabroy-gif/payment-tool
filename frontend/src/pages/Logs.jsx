@@ -89,6 +89,7 @@ export default function Logs() {
                         <option value="visa">VISA</option>
                         <option value="mastercard">Mastercard</option>
                         <option value="amex">AMEX</option>
+                        <option value="rupay">RuPay</option>
                     </select>
                     <button onClick={load} data-testid="logs-refresh-btn" className="col-span-12 md:col-span-1 h-9 border border-gray-300 text-xs hover:bg-gray-50">Refresh</button>
                 </div>

@@ -121,6 +121,21 @@ NETWORK_SPECS: Dict[str, Dict] = {
             63: {"name": "AMEX Reserved Private"},
         }),
     },
+    "rupay": {
+        "network_id": "rupay",
+        "name": "RuPay",
+        "description": "RuPay (NPCI) ISO-8583:1987 profile (ASCII) — India's domestic card network.",
+        "fields": _merge_overrides(BASE_FIELDS, {
+            18: {"name": "Merchant Category Code (MCC)"},
+            32: {"name": "Acquiring Institution ID (BIN)"},
+            48: {"name": "RuPay Additional Data – Private"},
+            49: {"name": "Currency Code (356 = INR)"},
+            61: {"name": "RuPay POS Extended Data"},
+            62: {"name": "RuPay Invoice / Addendum Data"},
+            63: {"name": "RuPay Network Private Data"},
+            123: {"name": "RuPay POS Data Code"},
+        }),
+    },
 }
 
 
