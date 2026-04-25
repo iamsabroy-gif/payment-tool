@@ -2,7 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams, Link } from "react-router-dom";
 import { api, apiErr } from "../lib/api";
 import { toast } from "sonner";
-import { FloppyDisk, PaperPlaneTilt, ArrowsClockwise, CheckCircle, XCircle } from "@phosphor-icons/react";
+import { FloppyDisk, PaperPlaneTilt, ArrowsClockwise, CheckCircle, XCircle, LockKey } from "@phosphor-icons/react";
+import PinHelperModal from "../components/PinHelperModal";
 
 const COMMON_MTIS = [
     { code: "0100", label: "Authorization Request" },
@@ -33,6 +34,7 @@ export default function Builder() {
     const [target, setTarget] = useState("simulator"); // 'simulator' | connection id
     const [connections, setConnections] = useState([]);
     const [connStatuses, setConnStatuses] = useState({}); // {id: {state}}
+    const [pinHelperOpen, setPinHelperOpen] = useState(false);
 
     useEffect(() => {
         api.get("/specs").then((r) => setSpecs(r.data));
@@ -387,13 +389,26 @@ export default function Builder() {
                                         </div>
                                     </div>
                                     <div className="col-span-12 md:col-span-7">
-                                        <input
-                                            data-testid={`de-input-${f}`}
-                                            value={values[f] || ""}
-                                            onChange={(e) => onValue(f, e.target.value)}
-                                            placeholder={meta.name}
-                                            className="w-full h-9 border border-gray-300 px-2 text-sm font-mono focus:border-[#002FA7]"
-                                        />
+                                        <div className="flex gap-2">
+                                            <input
+                                                data-testid={`de-input-${f}`}
+                                                value={values[f] || ""}
+                                                onChange={(e) => onValue(f, e.target.value)}
+                                                placeholder={meta.name}
+                                                className="flex-1 h-9 border border-gray-300 px-2 text-sm font-mono focus:border-[#002FA7]"
+                                            />
+                                            {f === 52 && (
+                                                <button
+                                                    type="button"
+                                                    onClick={() => setPinHelperOpen(true)}
+                                                    data-testid="pin-helper-open-btn"
+                                                    title="Build & encrypt a PIN block"
+                                                    className="h-9 px-3 border border-[#002FA7] text-[#002FA7] text-xs font-medium hover:bg-[#F3F4F6] flex items-center gap-1"
+                                                >
+                                                    <LockKey size={13} weight="bold" /> Encrypt PIN
+                                                </button>
+                                            )}
+                                        </div>
                                     </div>
                                 </div>
                             );
@@ -451,6 +466,13 @@ export default function Builder() {
                     </div>
                 </section>
             )}
+
+            <PinHelperModal
+                open={pinHelperOpen}
+                onClose={() => setPinHelperOpen(false)}
+                onApply={(hex) => onValue(52, hex)}
+                defaultPan={values[2] || ""}
+            />
         </div>
     );
 }

@@ -34,6 +34,7 @@ from iso8583 import (
 )
 from samples import SAMPLES
 from tcp_transport import send_over_tcp, LENGTH_HEADERS
+from pin_crypto import encrypt_pin_block, PIN_FORMATS, PIN_ALGORITHMS
 from session_manager import (
     connect_session,
     disconnect_session,
@@ -209,6 +210,14 @@ class TcpSendRequest(BaseModel):
     mti: str
     network_id: str = "visa"
     data_elements: Dict[str, str]
+
+
+class PinEncryptRequest(BaseModel):
+    pin: str
+    pan: Optional[str] = None
+    key_hex: str
+    format: str = "ISO-0"
+    algorithm: str = "3DES"
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +472,31 @@ async def simulate(body: SendTransactionRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"raw_hex": resp_hex, "parsed": resp_meta, "response_code": resp_meta.get("response_code")}
+
+
+@api.get("/pin/options")
+async def pin_options(_user=Depends(get_current_user)):
+    return {"formats": list(PIN_FORMATS), "algorithms": list(PIN_ALGORITHMS)}
+
+
+@api.post("/pin/encrypt")
+async def pin_encrypt(body: PinEncryptRequest, _user=Depends(get_current_user)):
+    try:
+        clear_hex, encrypted_hex = encrypt_pin_block(
+            pin=body.pin,
+            pan=body.pan or "",
+            key_hex=body.key_hex,
+            fmt=body.format,
+            algorithm=body.algorithm,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "clear_block_hex": clear_hex,
+        "encrypted_block_hex": encrypted_hex,
+        "format": body.format,
+        "algorithm": body.algorithm,
+    }
 
 
 # ---------------------------------------------------------------------------
