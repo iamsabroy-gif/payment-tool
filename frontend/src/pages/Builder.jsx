@@ -136,6 +136,9 @@ export default function Builder() {
                 data_elements: buildDeMap(),
             });
             setPreview(data);
+            if (data.validation_errors?.length) {
+                toast.warning(`${data.validation_errors.length} validation issue(s) — see preview panel`);
+            }
         } catch (e) {
             toast.error(apiErr(e));
         }
@@ -401,7 +404,15 @@ export default function Builder() {
 
             {preview && (
                 <section className="border border-[#E5E7EB]" data-testid="preview-panel">
-                    <div className="px-5 py-3 border-b border-[#E5E7EB] text-[11px] uppercase tracking-widest text-[#4B5563]">Wire preview</div>
+                    <div className="px-5 py-3 border-b border-[#E5E7EB] text-[11px] uppercase tracking-widest text-[#4B5563]">Wire preview · {preview.parsed?.wire_bytes ?? "?"} bytes</div>
+                    {preview.validation_errors?.length > 0 && (
+                        <div className="px-5 py-3 border-b border-[#E11D48] bg-[#FEF2F2]" data-testid="preview-errors">
+                            <div className="text-[11px] uppercase tracking-widest text-[#E11D48] mb-1.5">{preview.validation_errors.length} validation issue(s)</div>
+                            <ul className="text-xs text-[#9F1239] space-y-1 list-disc pl-5">
+                                {preview.validation_errors.map((e, i) => <li key={i}>{e}</li>)}
+                            </ul>
+                        </div>
+                    )}
                     <div className="p-5 space-y-2 text-xs">
                         <Row label="MTI" value={preview.parsed?.mti} mono />
                         <Row label="Bitmap" value={preview.parsed?.bitmap_hex} mono />

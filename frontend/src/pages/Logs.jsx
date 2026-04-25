@@ -197,7 +197,14 @@ function LogDetail({ log }) {
                             {fields.map((f) => (
                                 <div key={f.field} className="grid grid-cols-12 py-2 px-4 border-b border-[#F3F4F6]">
                                     <div className="col-span-2 text-[#002FA7] font-mono">[{String(f.field).padStart(3, "0")}]</div>
-                                    <div className="col-span-4 text-[#4B5563]">{f.name}</div>
+                                    <div className="col-span-4">
+                                        <div className="text-[#111827]">{f.name}</div>
+                                        {f.encoding && (
+                                            <div className="text-[10px] text-[#9CA3AF] font-mono uppercase tracking-wider mt-0.5">
+                                                {f.encoding} · {f.length_type}
+                                            </div>
+                                        )}
+                                    </div>
                                     <div className="col-span-6 font-mono break-all">{String(f.value)}</div>
                                 </div>
                             ))}

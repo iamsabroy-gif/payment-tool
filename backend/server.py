@@ -29,6 +29,7 @@ from iso8583 import (
     hex_to_base64,
     simulate_response,
     field_catalog,
+    validate_message,
     RESPONSE_CODES,
 )
 from samples import SAMPLES
@@ -365,11 +366,17 @@ async def delete_template(template_id: str, user=Depends(get_current_user)):
 # ---------------------------------------------------------------------------
 @api.post("/iso/preview")
 async def preview_message(body: SendTransactionRequest, _user=Depends(get_current_user)):
+    errors = validate_message(body.mti, body.data_elements, body.network_id)
     try:
         raw_hex, meta = encode_message(body.mti, body.data_elements, body.network_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return {"raw_hex": raw_hex, "raw_base64": hex_to_base64(raw_hex), "parsed": meta}
+    return {"raw_hex": raw_hex, "raw_base64": hex_to_base64(raw_hex), "parsed": meta, "validation_errors": errors}
+
+
+@api.post("/iso/validate")
+async def validate_only(body: SendTransactionRequest, _user=Depends(get_current_user)):
+    return {"errors": validate_message(body.mti, body.data_elements, body.network_id)}
 
 
 @api.post("/iso/send")
