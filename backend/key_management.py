@@ -214,3 +214,75 @@ def compute_arqc(icc_mk_hex: str, cdol_hex: str) -> str:
     h = _ecb_3des(K2 * 3, h, encrypt=False)   # single-DES decrypt with K2
     h = _ecb_3des(K1 * 3, h)                  # single-DES encrypt with K1
     return h.hex().upper()
+
+
+# ---------------------------------------------------------------------------
+# Session key derivation (EMV Common Session Key — CVN18 / CVN16, 3DES)
+# ---------------------------------------------------------------------------
+def derive_session_key_cvn18(icc_mk_hex: str, atc_hex: str) -> str:
+    """EMV CSK 3DES variant. Returns a 16-byte session key (odd parity)."""
+    icc_mk = _normalise_3des_key(icc_mk_hex)
+    atc = bytes.fromhex(atc_hex.replace(" ", "").rjust(4, "0"))[-2:]
+    F = atc + b"\xF0" + b"\x00" * 5
+    R = atc + b"\x0F" + b"\x00" * 5
+    sk = _ecb_3des(icc_mk, F) + _ecb_3des(icc_mk, R)
+    return _force_odd_parity(sk).hex().upper()
+
+
+# ---------------------------------------------------------------------------
+# AES ICC MK derivation + AES-CMAC ARQC (modern EMV-AES profiles)
+# ---------------------------------------------------------------------------
+def derive_icc_mk_aes(mdk_hex: str, pan: str, psn: str = "00") -> str:
+    """EMV AES ICC MK = AES_MDK(pad16(PAN || PSN, right-aligned, zero-pad on left to 16 digits))."""
+    pan_digits = "".join(c for c in pan if c.isdigit())
+    psn_digits = "".join(c for c in (psn or "00") if c.isdigit()).zfill(2)[:2]
+    src = (pan_digits + psn_digits).rjust(16, "0")[-16:]
+    block = bytes.fromhex(src) + b"\x00" * 8       # 16 bytes
+    mdk = _normalise_aes_key(mdk_hex)
+    return _ecb_aes(mdk, block).hex().upper()       # 16-byte ICC MK
+
+
+def derive_session_key_aes(icc_mk_hex: str, atc_hex: str) -> str:
+    """AES session key (16-byte) using EMV CSK over a 16-byte derivation block."""
+    icc_mk = _normalise_aes_key(icc_mk_hex)
+    atc = bytes.fromhex(atc_hex.replace(" ", "").rjust(4, "0"))[-2:]
+    block = atc + b"\xF0" + b"\x00" * 13
+    return _ecb_aes(icc_mk, block).hex().upper()
+
+
+def compute_arqc_aes(sk_hex: str, cdol_hex: str) -> str:
+    """ARQC under AES = first 8 bytes of AES-CMAC over the CDOL data."""
+    from cryptography.hazmat.primitives import cmac
+    sk = _normalise_aes_key(sk_hex)
+    c = cmac.CMAC(algorithms.AES(sk), backend=default_backend())
+    c.update(bytes.fromhex((cdol_hex or "").replace(" ", "")))
+    return c.finalize()[:8].hex().upper()
+
+
+# ---------------------------------------------------------------------------
+# ARPC — issuer-side response cryptogram (VAC / Mastercard ARPC, Method 1)
+# ---------------------------------------------------------------------------
+def compute_arpc(sk_hex: str, arqc_hex: str, arc_hex: str, algorithm: str = "3DES") -> str:
+    """ARPC Method 1: encrypt(SK, ARQC XOR (ARC || zero-pad)).
+
+    `arc_hex` is the 2-byte (4-hex) Authorization Response Code, e.g.
+    `3030` for ASCII "00" approved, `3035` for "05" decline, etc.
+    """
+    arqc = bytes.fromhex(arqc_hex.replace(" ", ""))
+    arc = bytes.fromhex(arc_hex.replace(" ", "").ljust(4, "0"))[:2]
+    if algorithm == "3DES":
+        if len(arqc) != 8:
+            raise ValueError("ARQC must be 8 bytes for 3DES ARPC.")
+        sk = _normalise_3des_key(sk_hex)
+        xored = _xor(arqc, arc + b"\x00" * 6)
+        return _ecb_3des(sk, xored).hex().upper()
+    elif algorithm == "AES":
+        # For AES the ARQC is still 8 bytes (truncated CMAC). Pad to 16, XOR ARC at the front.
+        if len(arqc) not in (8, 16):
+            raise ValueError("ARQC must be 8 or 16 bytes for AES ARPC.")
+        sk = _normalise_aes_key(sk_hex)
+        block = (arqc + b"\x00" * 16)[:16]
+        block = _xor(block, arc + b"\x00" * 14)
+        return _ecb_aes(sk, block).hex().upper()
+    else:
+        raise ValueError("algorithm must be 3DES or AES")

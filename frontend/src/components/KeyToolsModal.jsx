@@ -8,6 +8,7 @@ const TABS = [
     { id: "cvv",  label: "CVV (CVK)" },
     { id: "pvv",  label: "PVV (PVK)" },
     { id: "arqc", label: "ARQC (MDK)" },
+    { id: "arpc", label: "ARPC (issuer)" },
 ];
 
 export default function KeyToolsModal({ open, onClose, builderState, onInsertField }) {
@@ -51,6 +52,7 @@ export default function KeyToolsModal({ open, onClose, builderState, onInsertFie
                     {tab === "cvv"  && <CvvTab builderState={builderState} onInsertField={onInsertField} onClose={onClose} />}
                     {tab === "pvv"  && <PvvTab builderState={builderState} />}
                     {tab === "arqc" && <ArqcTab builderState={builderState} onInsertField={onInsertField} onClose={onClose} />}
+                    {tab === "arpc" && <ArpcTab onInsertField={onInsertField} onClose={onClose} />}
                 </div>
             </div>
         </div>

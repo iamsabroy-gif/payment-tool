@@ -35,7 +35,12 @@ from iso8583 import (
 from samples import SAMPLES
 from tcp_transport import send_over_tcp, LENGTH_HEADERS
 from pin_crypto import encrypt_pin_block, PIN_FORMATS, PIN_ALGORITHMS
-from key_management import compute_kcv, compute_cvv, compute_pvv, derive_icc_mk, compute_arqc
+from key_management import (
+    compute_kcv, compute_cvv, compute_pvv,
+    derive_icc_mk, compute_arqc,
+    derive_session_key_cvn18, derive_icc_mk_aes, derive_session_key_aes, compute_arqc_aes,
+    compute_arpc,
+)
 from session_manager import (
     connect_session,
     disconnect_session,
@@ -247,6 +252,15 @@ class ArqcRequest(BaseModel):
     pan: str
     psn: str = "00"
     cdol_hex: str
+    cvn: str = "CVN10"            # CVN10 | CVN18 | AES
+    atc_hex: Optional[str] = None  # required for CVN18 / AES
+
+
+class ArpcRequest(BaseModel):
+    sk_hex: str
+    arqc_hex: str
+    arc_hex: str = "3030"     # ASCII "00" by default = approved
+    algorithm: str = "3DES"
 
 
 # ---------------------------------------------------------------------------
@@ -568,19 +582,57 @@ async def keys_pvv(body: PvvRequest, _user=Depends(get_current_user)):
 @api.post("/keys/arqc")
 async def keys_arqc(body: ArqcRequest, _user=Depends(get_current_user)):
     try:
-        icc_mk = derive_icc_mk(body.mdk_hex, body.pan, body.psn)
-        arqc = compute_arqc(icc_mk, body.cdol_hex)
-        mdk_kcv = compute_kcv(body.mdk_hex, "3DES")
-        icc_kcv = compute_kcv(icc_mk, "3DES")
+        if body.cvn == "AES":
+            icc_mk = derive_icc_mk_aes(body.mdk_hex, body.pan, body.psn)
+            sk = derive_session_key_aes(icc_mk, body.atc_hex or "0000")
+            arqc = compute_arqc_aes(sk, body.cdol_hex)
+            mdk_kcv = compute_kcv(body.mdk_hex, "AES")
+            icc_kcv = compute_kcv(icc_mk, "AES")
+            sk_kcv = compute_kcv(sk, "AES")
+            algo = "AES"
+        else:
+            icc_mk = derive_icc_mk(body.mdk_hex, body.pan, body.psn)
+            if body.cvn == "CVN18":
+                if not body.atc_hex:
+                    raise ValueError("ATC is required for CVN18 derivation.")
+                sk = derive_session_key_cvn18(icc_mk, body.atc_hex)
+            else:  # CVN10 or default — SK = ICC MK
+                sk = icc_mk
+            arqc = compute_arqc(sk, body.cdol_hex)
+            mdk_kcv = compute_kcv(body.mdk_hex, "3DES")
+            icc_kcv = compute_kcv(icc_mk, "3DES")
+            sk_kcv = compute_kcv(sk, "3DES")
+            algo = "3DES"
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {
+        "cvn": body.cvn,
+        "algorithm": algo,
         "icc_mk_hex": icc_mk,
+        "session_key_hex": sk,
         "arqc_hex": arqc,
         "mdk_kcv": mdk_kcv,
         "icc_mk_kcv": icc_kcv,
-        # Pre-built BER-TLV bytes for F55 (tag 9F26 = ARQC, length 08, value 8 bytes)
+        "session_key_kcv": sk_kcv,
+        # Pre-built BER-TLV bytes for F55 (tag 9F26 = ARQC, length 08)
         "f55_tlv_hex": f"9F2608{arqc}",
+    }
+
+
+@api.post("/keys/arpc")
+async def keys_arpc(body: ArpcRequest, _user=Depends(get_current_user)):
+    try:
+        arpc = compute_arpc(body.sk_hex, body.arqc_hex, body.arc_hex, body.algorithm)
+        sk_kcv = compute_kcv(body.sk_hex, body.algorithm)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "arpc_hex": arpc,
+        "arc_hex": body.arc_hex.upper(),
+        "session_key_kcv": sk_kcv,
+        "algorithm": body.algorithm,
+        # F55 sub-element 91 = Issuer Authentication Data = ARPC || ARC (10 bytes total)
+        "f55_tlv_hex": f"910A{arpc}{body.arc_hex.upper().ljust(4, '0')}",
     }
 
 
