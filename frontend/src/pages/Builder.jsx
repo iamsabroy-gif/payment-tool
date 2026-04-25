@@ -2,8 +2,9 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams, Link } from "react-router-dom";
 import { api, apiErr } from "../lib/api";
 import { toast } from "sonner";
-import { FloppyDisk, PaperPlaneTilt, ArrowsClockwise, CheckCircle, XCircle, LockKey } from "@phosphor-icons/react";
+import { FloppyDisk, PaperPlaneTilt, ArrowsClockwise, CheckCircle, XCircle, LockKey, Key } from "@phosphor-icons/react";
 import PinHelperModal from "../components/PinHelperModal";
+import KeyToolsModal from "../components/KeyToolsModal";
 
 const COMMON_MTIS = [
     { code: "0100", label: "Authorization Request" },
@@ -35,6 +36,7 @@ export default function Builder() {
     const [connections, setConnections] = useState([]);
     const [connStatuses, setConnStatuses] = useState({}); // {id: {state}}
     const [pinHelperOpen, setPinHelperOpen] = useState(false);
+    const [keyToolsOpen, setKeyToolsOpen] = useState(false);
 
     useEffect(() => {
         api.get("/specs").then((r) => setSpecs(r.data));
@@ -241,6 +243,9 @@ export default function Builder() {
                     <h1 className="text-3xl font-semibold tracking-tight mt-1">Message Builder</h1>
                 </div>
                 <div className="flex items-center gap-2">
+                    <button data-testid="key-tools-btn" onClick={() => setKeyToolsOpen(true)} className="h-9 px-4 border border-gray-300 text-sm hover:bg-gray-50 flex items-center gap-2">
+                        <Key size={14} /> Key tools
+                    </button>
                     <button data-testid="preview-btn" onClick={doPreview} className="h-9 px-4 border border-gray-300 text-sm hover:bg-gray-50 flex items-center gap-2">
                         <ArrowsClockwise size={14} /> Preview
                     </button>
@@ -472,6 +477,16 @@ export default function Builder() {
                 onClose={() => setPinHelperOpen(false)}
                 onApply={(hex) => onValue(52, hex)}
                 defaultPan={values[2] || ""}
+            />
+
+            <KeyToolsModal
+                open={keyToolsOpen}
+                onClose={() => setKeyToolsOpen(false)}
+                builderState={{ values }}
+                onInsertField={(field, value) => {
+                    setActive((prev) => new Set(prev).add(field));
+                    onValue(field, value);
+                }}
             />
         </div>
     );

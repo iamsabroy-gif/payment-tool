@@ -35,6 +35,7 @@ from iso8583 import (
 from samples import SAMPLES
 from tcp_transport import send_over_tcp, LENGTH_HEADERS
 from pin_crypto import encrypt_pin_block, PIN_FORMATS, PIN_ALGORITHMS
+from key_management import compute_kcv, compute_cvv, compute_pvv, derive_icc_mk, compute_arqc
 from session_manager import (
     connect_session,
     disconnect_session,
@@ -218,6 +219,34 @@ class PinEncryptRequest(BaseModel):
     key_hex: str
     format: str = "ISO-0"
     algorithm: str = "3DES"
+
+
+class KcvRequest(BaseModel):
+    key_hex: str
+    algorithm: str = "3DES"
+
+
+class CvvRequest(BaseModel):
+    pan: str
+    expiry: str  # YYMM
+    service_code: str  # 3 digits
+    cvk_a_hex: str
+    cvk_b_hex: str
+
+
+class PvvRequest(BaseModel):
+    pan: str
+    pin: str
+    pvki: str = "1"
+    pvk_a_hex: str
+    pvk_b_hex: str
+
+
+class ArqcRequest(BaseModel):
+    mdk_hex: str
+    pan: str
+    psn: str = "00"
+    cdol_hex: str
 
 
 # ---------------------------------------------------------------------------
@@ -491,11 +520,67 @@ async def pin_encrypt(body: PinEncryptRequest, _user=Depends(get_current_user)):
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # KCV of the PEK so two parties can verify they share the same key.
+    try:
+        kcv = compute_kcv(body.key_hex, body.algorithm)
+    except Exception:
+        kcv = ""
     return {
         "clear_block_hex": clear_hex,
         "encrypted_block_hex": encrypted_hex,
         "format": body.format,
         "algorithm": body.algorithm,
+        "key_kcv": kcv,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Key management tools (KCV / CVV / PVV / ARQC)
+# ---------------------------------------------------------------------------
+@api.post("/keys/kcv")
+async def keys_kcv(body: KcvRequest, _user=Depends(get_current_user)):
+    try:
+        return {"kcv": compute_kcv(body.key_hex, body.algorithm), "algorithm": body.algorithm}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@api.post("/keys/cvv")
+async def keys_cvv(body: CvvRequest, _user=Depends(get_current_user)):
+    try:
+        cvv = compute_cvv(body.pan, body.expiry, body.service_code, body.cvk_a_hex, body.cvk_b_hex)
+        kcv = compute_kcv(body.cvk_a_hex + body.cvk_b_hex, "3DES")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"cvv": cvv, "cvk_kcv": kcv, "service_code": body.service_code}
+
+
+@api.post("/keys/pvv")
+async def keys_pvv(body: PvvRequest, _user=Depends(get_current_user)):
+    try:
+        pvv = compute_pvv(body.pan, body.pin, body.pvki, body.pvk_a_hex, body.pvk_b_hex)
+        kcv = compute_kcv(body.pvk_a_hex + body.pvk_b_hex, "3DES")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"pvv": pvv, "pvki": body.pvki, "pvk_kcv": kcv}
+
+
+@api.post("/keys/arqc")
+async def keys_arqc(body: ArqcRequest, _user=Depends(get_current_user)):
+    try:
+        icc_mk = derive_icc_mk(body.mdk_hex, body.pan, body.psn)
+        arqc = compute_arqc(icc_mk, body.cdol_hex)
+        mdk_kcv = compute_kcv(body.mdk_hex, "3DES")
+        icc_kcv = compute_kcv(icc_mk, "3DES")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "icc_mk_hex": icc_mk,
+        "arqc_hex": arqc,
+        "mdk_kcv": mdk_kcv,
+        "icc_mk_kcv": icc_kcv,
+        # Pre-built BER-TLV bytes for F55 (tag 9F26 = ARQC, length 08, value 8 bytes)
+        "f55_tlv_hex": f"9F2608{arqc}",
     }
 
 

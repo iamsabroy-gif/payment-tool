@@ -104,6 +104,7 @@ export default function PinHelperModal({ open, onClose, onApply, defaultPan }) {
                         <div className="border border-[#E5E7EB] bg-[#F9FAFB] p-3 space-y-2 text-xs" data-testid="pin-result">
                             <Row label="Clear block" value={result.clear_block_hex} mono />
                             <Row label="Encrypted block" value={result.encrypted_block_hex} mono accent />
+                            {result.key_kcv && <Row label="Key KCV" value={result.key_kcv} mono />}
                             <div className="text-[10px] uppercase tracking-widest text-[#4B5563] pt-1 border-t border-[#E5E7EB]">
                                 {result.format} · {result.algorithm}
                             </div>
