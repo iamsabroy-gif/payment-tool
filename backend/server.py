@@ -274,6 +274,19 @@ class ArpcRequest(BaseModel):
     algorithm: str = "3DES"
 
 
+class BucketCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    template_ids: List[str]
+
+
+class BucketRunRequest(BaseModel):
+    """Run a saved bucket OR an ad-hoc list of templates against a target."""
+    template_ids: Optional[List[str]] = None  # only used by /buckets/run-once
+    target: str = "simulator"                 # "simulator" | <connection_profile_id>
+    delay_ms: int = Field(default=0, ge=0, le=10_000)
+
+
 # ---------------------------------------------------------------------------
 # Auth endpoints
 # ---------------------------------------------------------------------------
@@ -422,6 +435,142 @@ async def delete_template(template_id: str, user=Depends(get_current_user)):
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Template not found")
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Internal: execute a single template against a target (simulator or connection)
+# ---------------------------------------------------------------------------
+async def _execute_message(
+    *,
+    user: dict,
+    mti: str,
+    network_id: str,
+    data_elements: Dict[str, str],
+    target: str = "simulator",          # "simulator" | <connection_profile_id>
+    bucket_run_id: Optional[str] = None,
+    template_id: Optional[str] = None,
+    template_name: Optional[str] = None,
+) -> Dict:
+    """Encode + send + persist outbound/inbound logs.
+
+    Re-uses the same code paths as `/api/iso/send` (simulator) and
+    `/api/iso/send-tcp` (TCP/WebSocket through a saved connection profile).
+    Returns ``{outbound, inbound, response_code, error}``.
+    """
+    await enforce_log_quota(user)
+
+    # ---- Simulator branch -------------------------------------------------
+    if not target or target == "simulator":
+        try:
+            req_hex, req_meta = encode_message(mti, data_elements, network_id)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        outbound_id = str(uuid.uuid4())
+        outbound_log = {
+            "id": outbound_id, "user_id": user["id"], "timestamp": now_iso(),
+            "direction": "outbound", "network_id": network_id, "mti": mti,
+            "raw_hex": req_hex, "raw_base64": hex_to_base64(req_hex),
+            "parsed": req_meta, "status_code": None, "related_id": None,
+            "endpoint_url": "internal://simulator",
+            "bucket_run_id": bucket_run_id, "template_id": template_id, "template_name": template_name,
+        }
+        resp_hex, resp_meta = simulate_response(mti, data_elements, network_id)
+        rc = resp_meta.get("response_code", "00")
+        inbound_id = str(uuid.uuid4())
+        inbound_log = {
+            "id": inbound_id, "user_id": user["id"], "timestamp": now_iso(),
+            "direction": "inbound", "network_id": network_id,
+            "mti": resp_meta.get("mti") if isinstance(resp_meta, dict) else mti,
+            "raw_hex": resp_hex, "raw_base64": hex_to_base64(resp_hex) if resp_hex else "",
+            "parsed": resp_meta, "status_code": rc, "related_id": outbound_id,
+            "endpoint_url": "internal://simulator",
+            "bucket_run_id": bucket_run_id, "template_id": template_id, "template_name": template_name,
+        }
+        outbound_log["related_id"] = inbound_id
+        outbound_log["status_code"] = rc
+        await db.transaction_logs.insert_many([outbound_log, inbound_log])
+        for d in (outbound_log, inbound_log): d.pop("_id", None)
+        return {"outbound": outbound_log, "inbound": inbound_log, "response_code": rc, "error": None}
+
+    # ---- Saved connection profile branch ---------------------------------
+    conn = await db.connection_profiles.find_one({"id": target, "user_id": user["id"]}, {"_id": 0})
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection profile not found")
+    if not session_is_connected(target):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Connection '{conn['name']}' is not active. Open it from the Connections page.",
+        )
+    transport = conn.get("transport", "tcp")
+    length_header = conn["length_header"]
+    wire_format = conn.get("wire_format", "native")
+    if transport == "tcp":
+        endpoint_label = f"tcp{'s' if conn.get('use_tls') else ''}://{conn.get('host')}:{conn.get('port')} [{length_header}]"
+    else:
+        endpoint_label = f"{conn['ws_url']} [ws · {length_header} · {wire_format}]"
+
+    try:
+        req_hex, req_meta = encode_message(mti, data_elements, network_id, wire_format=wire_format)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    outbound_id = str(uuid.uuid4())
+    outbound_log = {
+        "id": outbound_id, "user_id": user["id"], "timestamp": now_iso(),
+        "direction": "outbound", "network_id": network_id, "mti": mti,
+        "raw_hex": req_hex, "raw_base64": hex_to_base64(req_hex),
+        "parsed": req_meta, "status_code": None, "related_id": None,
+        "endpoint_url": endpoint_label,
+        "connection_id": target, "connection_name": conn["name"],
+        "transport": transport, "wire_format": wire_format,
+        "bucket_run_id": bucket_run_id, "template_id": template_id, "template_name": template_name,
+    }
+
+    tcp_error: Optional[str] = None
+    try:
+        body_bytes = bytes.fromhex(req_hex)
+        framed, response_bytes = await send_on_session(target, body_bytes)
+        resp_hex = response_bytes.hex().upper()
+        try:
+            resp_meta = decode_message(resp_hex, network_id, wire_format=wire_format)
+            rc = "??"
+            for fobj in resp_meta.get("fields", []):
+                if fobj["field"] == 39:
+                    rc = str(fobj["value"]).strip() or "??"
+                    break
+            resp_meta["response_code"] = rc
+            resp_meta["response_code_description"] = RESPONSE_CODES.get(rc, "Unknown")
+        except Exception as dec_err:
+            resp_meta = {"error": f"decode failed: {dec_err}", "raw_ascii": response_bytes.decode("latin-1", errors="replace")}
+            rc = "??"
+    except (asyncio.TimeoutError, TimeoutError) as e:
+        resp_hex = ""; resp_meta = {"error": "timeout"}; rc = "91"; tcp_error = str(e) or "timeout"
+    except (ConnectionRefusedError, OSError) as e:
+        resp_hex = ""; resp_meta = {"error": f"connection failed: {e}"}; rc = "96"; tcp_error = str(e)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("bucket send failed: %s", e)
+        resp_hex = ""; resp_meta = {"error": str(e)}; rc = "96"; tcp_error = str(e)
+
+    inbound_id = str(uuid.uuid4())
+    inbound_log = {
+        "id": inbound_id, "user_id": user["id"], "timestamp": now_iso(),
+        "direction": "inbound", "network_id": network_id,
+        "mti": resp_meta.get("mti") if isinstance(resp_meta, dict) else mti,
+        "raw_hex": resp_hex, "raw_base64": hex_to_base64(resp_hex) if resp_hex else "",
+        "parsed": resp_meta, "status_code": rc, "related_id": outbound_id,
+        "endpoint_url": endpoint_label,
+        "connection_id": target, "connection_name": conn["name"],
+        "transport": transport, "wire_format": wire_format,
+        "bucket_run_id": bucket_run_id, "template_id": template_id, "template_name": template_name,
+        "error": tcp_error,
+    }
+    outbound_log["related_id"] = inbound_id
+    outbound_log["status_code"] = rc
+    await db.transaction_logs.insert_many([outbound_log, inbound_log])
+    for d in (outbound_log, inbound_log): d.pop("_id", None)
+    return {"outbound": outbound_log, "inbound": inbound_log, "response_code": rc, "error": tcp_error}
 
 
 # ---------------------------------------------------------------------------
@@ -956,6 +1105,189 @@ async def clone_sample(sample_id: str, user=Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------------
+# Buckets — collections of saved templates that run sequentially
+# ---------------------------------------------------------------------------
+async def _hydrate_bucket(doc: dict) -> dict:
+    """Add `templates` array (id+name+mti+network) for the UI."""
+    tids = doc.get("template_ids") or []
+    if not tids:
+        doc["templates"] = []
+        return doc
+    cursor = db.templates.find(
+        {"id": {"$in": tids}, "user_id": doc["user_id"]},
+        {"_id": 0, "id": 1, "name": 1, "mti": 1, "network_id": 1},
+    )
+    found = {t["id"]: t async for t in cursor}
+    # preserve user-defined order, mark missing items
+    doc["templates"] = [
+        found.get(tid, {"id": tid, "name": "(deleted)", "mti": "????", "network_id": "—"})
+        for tid in tids
+    ]
+    return doc
+
+
+@api.get("/buckets")
+async def list_buckets(user=Depends(get_current_user)):
+    docs = await db.buckets.find(
+        {"user_id": user["id"]}, {"_id": 0}
+    ).sort("created_at", -1).to_list(200)
+    return [await _hydrate_bucket(d) for d in docs]
+
+
+@api.post("/buckets")
+async def create_bucket(body: BucketCreate, user=Depends(get_current_user)):
+    if not body.template_ids:
+        raise HTTPException(status_code=400, detail="At least one template_id required")
+    # validate ownership
+    own = await db.templates.count_documents(
+        {"id": {"$in": body.template_ids}, "user_id": user["id"]}
+    )
+    if own != len(set(body.template_ids)):
+        raise HTTPException(status_code=400, detail="One or more templates not found")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": user["id"],
+        "name": body.name.strip() or f"Bucket {now_iso()[:19]}",
+        "description": (body.description or "").strip(),
+        "template_ids": body.template_ids,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "last_run_at": None,
+        "last_run_id": None,
+    }
+    await db.buckets.insert_one(doc)
+    doc.pop("_id", None)
+    return await _hydrate_bucket(doc)
+
+
+@api.put("/buckets/{bucket_id}")
+async def update_bucket(bucket_id: str, body: BucketCreate, user=Depends(get_current_user)):
+    if not body.template_ids:
+        raise HTTPException(status_code=400, detail="At least one template_id required")
+    res = await db.buckets.update_one(
+        {"id": bucket_id, "user_id": user["id"]},
+        {"$set": {
+            "name": body.name.strip(),
+            "description": (body.description or "").strip(),
+            "template_ids": body.template_ids,
+            "updated_at": now_iso(),
+        }},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Bucket not found")
+    doc = await db.buckets.find_one({"id": bucket_id}, {"_id": 0})
+    return await _hydrate_bucket(doc)
+
+
+@api.delete("/buckets/{bucket_id}")
+async def delete_bucket(bucket_id: str, user=Depends(get_current_user)):
+    res = await db.buckets.delete_one({"id": bucket_id, "user_id": user["id"]})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Bucket not found")
+    return {"ok": True}
+
+
+async def _run_template_ids(
+    *, user: dict, template_ids: List[str], target: str, delay_ms: int, bucket_run_id: str,
+) -> List[Dict]:
+    """Sequentially execute templates and return per-step result rows."""
+    results: List[Dict] = []
+    for idx, tid in enumerate(template_ids):
+        tpl = await db.templates.find_one({"id": tid, "user_id": user["id"]}, {"_id": 0})
+        if not tpl:
+            results.append({"step": idx + 1, "template_id": tid, "template_name": "(deleted)",
+                            "status_code": None, "error": "template not found"})
+            continue
+        try:
+            r = await _execute_message(
+                user=user, mti=tpl["mti"], network_id=tpl["network_id"],
+                data_elements=tpl["data_elements"], target=target,
+                bucket_run_id=bucket_run_id, template_id=tid, template_name=tpl["name"],
+            )
+            results.append({
+                "step": idx + 1, "template_id": tid, "template_name": tpl["name"],
+                "mti": tpl["mti"], "network_id": tpl["network_id"],
+                "status_code": r["response_code"],
+                "response_description": RESPONSE_CODES.get(r["response_code"], "Unknown"),
+                "outbound_log_id": r["outbound"]["id"],
+                "inbound_log_id": r["inbound"]["id"],
+                "error": r.get("error"),
+            })
+        except HTTPException as he:
+            results.append({"step": idx + 1, "template_id": tid, "template_name": tpl["name"],
+                            "status_code": None, "error": f"{he.status_code}: {he.detail}"})
+            # If it's a quota / connection issue, abort the rest of the bucket.
+            if he.status_code in (402, 409):
+                break
+        except Exception as e:
+            logger.exception("bucket step failed for %s", tid)
+            results.append({"step": idx + 1, "template_id": tid, "template_name": tpl["name"],
+                            "status_code": None, "error": str(e)})
+        if delay_ms and idx < len(template_ids) - 1:
+            await asyncio.sleep(delay_ms / 1000.0)
+    return results
+
+
+@api.post("/buckets/{bucket_id}/run")
+async def run_bucket(bucket_id: str, body: BucketRunRequest, user=Depends(get_current_user)):
+    bucket = await db.buckets.find_one({"id": bucket_id, "user_id": user["id"]}, {"_id": 0})
+    if not bucket:
+        raise HTTPException(status_code=404, detail="Bucket not found")
+    bucket_run_id = str(uuid.uuid4())
+    started = now_iso()
+    results = await _run_template_ids(
+        user=user, template_ids=bucket["template_ids"],
+        target=body.target, delay_ms=body.delay_ms, bucket_run_id=bucket_run_id,
+    )
+    finished = now_iso()
+    await db.buckets.update_one(
+        {"id": bucket_id},
+        {"$set": {"last_run_at": finished, "last_run_id": bucket_run_id, "updated_at": finished}},
+    )
+    return {
+        "bucket_run_id": bucket_run_id,
+        "bucket_id": bucket_id,
+        "bucket_name": bucket["name"],
+        "started_at": started,
+        "finished_at": finished,
+        "target": body.target,
+        "delay_ms": body.delay_ms,
+        "total": len(bucket["template_ids"]),
+        "succeeded": sum(1 for r in results if r.get("status_code") == "00"),
+        "failed": sum(1 for r in results if r.get("status_code") not in (None, "00")),
+        "errored": sum(1 for r in results if r.get("error")),
+        "results": results,
+    }
+
+
+@api.post("/buckets/run-once")
+async def run_bucket_once(body: BucketRunRequest, user=Depends(get_current_user)):
+    if not body.template_ids:
+        raise HTTPException(status_code=400, detail="template_ids required")
+    bucket_run_id = str(uuid.uuid4())
+    started = now_iso()
+    results = await _run_template_ids(
+        user=user, template_ids=body.template_ids,
+        target=body.target, delay_ms=body.delay_ms, bucket_run_id=bucket_run_id,
+    )
+    finished = now_iso()
+    return {
+        "bucket_run_id": bucket_run_id,
+        "bucket_id": None,
+        "bucket_name": "(ad-hoc run)",
+        "started_at": started,
+        "finished_at": finished,
+        "target": body.target,
+        "delay_ms": body.delay_ms,
+        "total": len(body.template_ids),
+        "succeeded": sum(1 for r in results if r.get("status_code") == "00"),
+        "failed": sum(1 for r in results if r.get("status_code") not in (None, "00")),
+        "errored": sum(1 for r in results if r.get("error")),
+        "results": results,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Transaction logs
 # ---------------------------------------------------------------------------
 @api.get("/logs")
@@ -965,6 +1297,7 @@ async def list_logs(
     direction: Optional[str] = None,
     status: Optional[str] = None,
     network: Optional[str] = None,
+    bucket_run_id: Optional[str] = None,
     limit: int = Query(100, le=500),
     offset: int = 0,
 ):
@@ -975,6 +1308,8 @@ async def list_logs(
         filt["status_code"] = status
     if network:
         filt["network_id"] = network
+    if bucket_run_id:
+        filt["bucket_run_id"] = bucket_run_id
     if q:
         filt["$or"] = [
             {"mti": {"$regex": q, "$options": "i"}},
@@ -985,6 +1320,104 @@ async def list_logs(
     items = await cursor.to_list(limit)
     total = await db.transaction_logs.count_documents(filt)
     return {"items": items, "total": total}
+
+
+def _format_log_block(doc: dict) -> str:
+    """Render one transaction_log document as a human-readable .txt block."""
+    ts = (doc.get("timestamp") or "").replace("T", " ").replace("+00:00", " UTC")
+    direction = (doc.get("direction") or "?").upper().ljust(8)
+    network = (doc.get("network_id") or "—")
+    mti = doc.get("mti") or "????"
+    rc = doc.get("status_code") or "—"
+    rc_desc = RESPONSE_CODES.get(rc, "")
+    endpoint = doc.get("endpoint_url") or "—"
+    parsed = doc.get("parsed") or {}
+    fields = parsed.get("fields") if isinstance(parsed, dict) else None
+    bitmap_hex = parsed.get("bitmap_hex") if isinstance(parsed, dict) else None
+
+    lines = [
+        "=" * 78,
+        f"[{ts}] {direction} {network:<10}  MTI={mti}  RC={rc} {rc_desc}".rstrip(),
+        f"Endpoint : {endpoint}",
+    ]
+    if doc.get("connection_name"):
+        lines.append(f"Profile  : {doc['connection_name']}  ({doc.get('transport') or 'tcp'} · {doc.get('wire_format') or 'native'})")
+    if doc.get("template_name"):
+        lines.append(f"Template : {doc['template_name']}")
+    if doc.get("bucket_run_id"):
+        lines.append(f"Bucket   : run {doc['bucket_run_id']}")
+    if doc.get("error"):
+        lines.append(f"Error    : {doc['error']}")
+    if bitmap_hex:
+        lines.append(f"Bitmap   : {bitmap_hex}")
+    if isinstance(fields, list) and fields:
+        lines.append("-- Parsed Data Elements --")
+        for f in fields:
+            num = f.get("field")
+            name = (f.get("name") or "").strip()
+            fmt = f.get("format") or ""
+            ltype = f.get("length_type") or ""
+            value = f.get("value")
+            shown = ("…" if value is None else str(value))
+            if len(shown) > 200:
+                shown = shown[:197] + "…"
+            lines.append(f"  DE{num:03d}  {name:<35.35} {fmt:<4} {ltype:<5}  {shown}")
+    if isinstance(parsed, dict) and parsed.get("error"):
+        lines.append(f"Parse error: {parsed['error']}")
+    raw_hex = (doc.get("raw_hex") or "").upper()
+    if raw_hex:
+        lines.append("-- Raw hex --")
+        # wrap hex into 48-char rows for readability
+        for i in range(0, len(raw_hex), 48):
+            lines.append("  " + raw_hex[i:i + 48])
+    lines.append("")
+    return "\n".join(lines)
+
+
+@api.get("/logs/export")
+async def export_logs(
+    user=Depends(get_current_user),
+    q: Optional[str] = None,
+    direction: Optional[str] = None,
+    status: Optional[str] = None,
+    network: Optional[str] = None,
+    bucket_run_id: Optional[str] = None,
+    limit: int = Query(500, le=5000),
+):
+    """Plain-text export of captured transaction logs (ISO-8583 readable form)."""
+    filt: Dict = {"user_id": user["id"]}
+    if direction in ("inbound", "outbound"):
+        filt["direction"] = direction
+    if status:
+        filt["status_code"] = status
+    if network:
+        filt["network_id"] = network
+    if bucket_run_id:
+        filt["bucket_run_id"] = bucket_run_id
+    if q:
+        filt["$or"] = [
+            {"mti": {"$regex": q, "$options": "i"}},
+            {"raw_hex": {"$regex": q, "$options": "i"}},
+            {"status_code": {"$regex": q, "$options": "i"}},
+        ]
+    cursor = db.transaction_logs.find(filt, {"_id": 0}).sort("timestamp", 1).limit(limit)
+    docs = await cursor.to_list(limit)
+    header = [
+        "ISO-8583 LAB · Transaction log export",
+        f"Generated : {now_iso()}",
+        f"User      : {user.get('email')}",
+        f"Filters   : direction={direction or '*'}  status={status or '*'}  "
+        f"network={network or '*'}  q={q or '*'}  bucket_run={bucket_run_id or '*'}",
+        f"Total     : {len(docs)} entries (cap {limit})",
+        "",
+    ]
+    body = "\n".join(header) + "\n".join(_format_log_block(d) for d in docs)
+    fname = f"iso8583-logs-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.txt"
+    return Response(
+        content=body,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 @api.get("/logs/{log_id}")
@@ -1242,6 +1675,8 @@ async def on_startup():
     await db.templates.create_index([("user_id", 1), ("created_at", -1)])
     await db.payment_transactions.create_index("session_id", unique=True)
     await db.connection_profiles.create_index([("user_id", 1), ("created_at", -1)])
+    await db.buckets.create_index([("user_id", 1), ("created_at", -1)])
+    await db.transaction_logs.create_index([("user_id", 1), ("bucket_run_id", 1)])
     await db.login_attempts.create_index("identifier")
     await seed_admin()
     await seed_specs()

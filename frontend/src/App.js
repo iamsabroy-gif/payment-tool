@@ -14,6 +14,7 @@ import Logs from "./pages/Logs";
 import Pricing from "./pages/Pricing";
 import CheckoutReturn from "./pages/CheckoutReturn";
 import Connections from "./pages/Connections";
+import Buckets from "./pages/Buckets";
 
 function PublicOnly({ children }) {
     const { user, loading } = useAuth();
@@ -44,6 +45,7 @@ function App() {
                             <Route index element={<Dashboard />} />
                             <Route path="builder" element={<Builder />} />
                             <Route path="templates" element={<Templates />} />
+                            <Route path="buckets" element={<Buckets />} />
                             <Route path="logs" element={<Logs />} />
                             <Route path="connections" element={<Connections />} />
                             <Route path="pricing" element={<Pricing />} />

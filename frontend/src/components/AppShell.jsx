@@ -9,12 +9,14 @@ import {
     SignOut,
     Lightning,
     Plug,
+    Stack,
 } from "@phosphor-icons/react";
 
 const NAV = [
     { to: "/app", label: "Dashboard", icon: ChartBar, end: true, testid: "nav-dashboard" },
     { to: "/app/builder", label: "Builder", icon: Wrench, testid: "nav-builder" },
     { to: "/app/templates", label: "Templates", icon: BookBookmark, testid: "nav-templates" },
+    { to: "/app/buckets", label: "Buckets", icon: Stack, testid: "nav-buckets" },
     { to: "/app/logs", label: "Logs", icon: ListDashes, testid: "nav-logs" },
     { to: "/app/connections", label: "Connections", icon: Plug, testid: "nav-connections" },
     { to: "/app/pricing", label: "Billing", icon: CreditCard, testid: "nav-pricing" },

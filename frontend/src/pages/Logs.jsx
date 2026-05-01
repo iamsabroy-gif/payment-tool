@@ -1,25 +1,34 @@
-import { useEffect, useState, useMemo, useCallback } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api, apiErr } from "../lib/api";
 import { PanelGroup, Panel, PanelResizeHandle } from "react-resizable-panels";
-import { MagnifyingGlass, CheckCircle, XCircle, ArrowsDownUp } from "@phosphor-icons/react";
+import { MagnifyingGlass, CheckCircle, XCircle, ArrowsDownUp, DownloadSimple, X } from "@phosphor-icons/react";
+import { toast } from "sonner";
 
 export default function Logs() {
-    const [params] = useSearchParams();
+    const [params, setParams] = useSearchParams();
     const [q, setQ] = useState("");
     const [direction, setDirection] = useState("");
     const [status, setStatus] = useState("");
     const [network, setNetwork] = useState("");
+    const bucketRunId = params.get("bucket_run_id") || "";
     const [items, setItems] = useState([]);
     const [total, setTotal] = useState(0);
     const [selected, setSelected] = useState(null);
     const [loading, setLoading] = useState(true);
+    const [exporting, setExporting] = useState(false);
 
     const load = useCallback(async () => {
         setLoading(true);
         try {
             const { data } = await api.get("/logs", {
-                params: { q: q || undefined, direction: direction || undefined, status: status || undefined, network: network || undefined },
+                params: {
+                    q: q || undefined,
+                    direction: direction || undefined,
+                    status: status || undefined,
+                    network: network || undefined,
+                    bucket_run_id: bucketRunId || undefined,
+                },
             });
             setItems(data.items);
             setTotal(data.total);
@@ -28,7 +37,7 @@ export default function Logs() {
         } finally {
             setLoading(false);
         }
-    }, [q, direction, status, network]);
+    }, [q, direction, status, network, bucketRunId]);
 
     useEffect(() => { load(); }, [load]);
 
@@ -50,6 +59,36 @@ export default function Logs() {
         }
     };
 
+    const exportTxt = async () => {
+        setExporting(true);
+        try {
+            const { data } = await api.get("/logs/export", {
+                params: {
+                    q: q || undefined,
+                    direction: direction || undefined,
+                    status: status || undefined,
+                    network: network || undefined,
+                    bucket_run_id: bucketRunId || undefined,
+                },
+                responseType: "blob",
+            });
+            const url = URL.createObjectURL(new Blob([data], { type: "text/plain" }));
+            const a = document.createElement("a");
+            const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+            a.href = url; a.download = `iso8583-logs-${ts}.txt`;
+            document.body.appendChild(a); a.click(); a.remove();
+            URL.revokeObjectURL(url);
+            toast.success("Logs exported");
+        } catch (e) { toast.error(apiErr(e)); }
+        finally { setExporting(false); }
+    };
+
+    const clearBucketFilter = () => {
+        const next = new URLSearchParams(params);
+        next.delete("bucket_run_id");
+        setParams(next);
+    };
+
     return (
         <div className="h-screen flex flex-col" data-testid="logs-page">
             <header className="px-6 pt-6 pb-4 border-b border-[#E5E7EB]">
@@ -58,8 +97,29 @@ export default function Logs() {
                         <div className="text-[11px] tracking-[0.2em] uppercase text-[#4B5563]">04 · Capture</div>
                         <h1 className="text-3xl font-semibold tracking-tight mt-1">Transaction Logs</h1>
                     </div>
-                    <div className="text-[11px] font-mono text-[#4B5563]" data-testid="logs-total">{total} records</div>
+                    <div className="flex items-center gap-3">
+                        <div className="text-[11px] font-mono text-[#4B5563]" data-testid="logs-total">{total} records</div>
+                        <button
+                            onClick={exportTxt}
+                            disabled={exporting || total === 0}
+                            data-testid="logs-export-btn"
+                            className="h-9 px-3 border border-[#002FA7] text-[#002FA7] text-xs font-semibold hover:bg-[#F3F4F6] flex items-center gap-1 disabled:opacity-50"
+                            title="Download captured logs as a plain-text ISO-8583 dump"
+                        >
+                            <DownloadSimple size={13} weight="bold" /> {exporting ? "Exporting…" : "Export .txt"}
+                        </button>
+                    </div>
                 </div>
+
+                {bucketRunId && (
+                    <div className="mt-3 flex items-center gap-2 text-[11px]" data-testid="logs-bucket-filter">
+                        <span className="uppercase tracking-widest text-[#4B5563]">Filtered to bucket run</span>
+                        <span className="font-mono px-2 py-0.5 border border-[#002FA7] text-[#002FA7] bg-[#F3F4F6]">{bucketRunId.slice(0, 8)}…</span>
+                        <button onClick={clearBucketFilter} data-testid="logs-bucket-clear" className="text-[#9CA3AF] hover:text-[#E11D48] flex items-center gap-1">
+                            <X size={11} /> clear
+                        </button>
+                    </div>
+                )}
 
                 <div className="mt-4 grid grid-cols-12 gap-2">
                     <div className="col-span-12 md:col-span-5 relative">
