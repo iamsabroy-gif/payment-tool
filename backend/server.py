@@ -1164,6 +1164,11 @@ async def create_bucket(body: BucketCreate, user=Depends(get_current_user)):
 async def update_bucket(bucket_id: str, body: BucketCreate, user=Depends(get_current_user)):
     if not body.template_ids:
         raise HTTPException(status_code=400, detail="At least one template_id required")
+    own = await db.templates.count_documents(
+        {"id": {"$in": body.template_ids}, "user_id": user["id"]}
+    )
+    if own != len(set(body.template_ids)):
+        raise HTTPException(status_code=400, detail="One or more templates not found")
     res = await db.buckets.update_one(
         {"id": bucket_id, "user_id": user["id"]},
         {"$set": {
@@ -1264,6 +1269,11 @@ async def run_bucket(bucket_id: str, body: BucketRunRequest, user=Depends(get_cu
 async def run_bucket_once(body: BucketRunRequest, user=Depends(get_current_user)):
     if not body.template_ids:
         raise HTTPException(status_code=400, detail="template_ids required")
+    own = await db.templates.count_documents(
+        {"id": {"$in": body.template_ids}, "user_id": user["id"]}
+    )
+    if own != len(set(body.template_ids)):
+        raise HTTPException(status_code=400, detail="One or more templates not found")
     bucket_run_id = str(uuid.uuid4())
     started = now_iso()
     results = await _run_template_ids(

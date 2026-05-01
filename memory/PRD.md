@@ -48,7 +48,7 @@ ISO-8583 payload to an external CBS endpoint.
 - **Connection profiles** w/ live status indicator, heartbeats, edit/connect/
   disconnect, transport-aware UI (TCP vs WebSocket fields).
 
-### 2026-02 — Live WS wiring + secondary-bitmap fix (this session)
+### 2026-02 — Live WS wiring + secondary-bitmap fix
 - `ConnectionProfile.auth_token` field added — paste a pre-issued JWT directly
   (preferred over username/password). Token is appended to the WS URL as
   `?token=<JWT>` by `ws_transport.open_ws_connection`.
@@ -61,8 +61,42 @@ ISO-8583 payload to an external CBS endpoint.
 - Live round-trip verified end-to-end against
   `wss://iso8583-server.emergent.host/api/ws/iso8583` with 0800 → 0810 RC=00.
 - New unit tests `tests/test_iso8583_codecs.py` (4 tests covering native +
-  ASCII round-trips and the secondary-bitmap regression). Full backend
-  pytest now 34/34.
+  ASCII round-trips and the secondary-bitmap regression).
+
+### 2026-02 — ARPC tab fix
+- `KeyToolsModal.jsx` referenced `<ArpcTab />` but never defined it. Added
+  the missing component (algorithm + SK + ARQC + ARC inputs → existing
+  `POST /api/keys/arpc` → renders ARPC, ARC, SK KCV, F55 TLV with one-click
+  *Insert as F55 (91 IAD)* into the Builder).
+
+### 2026-02 — Buckets + Logs export (this session)
+- Added `db.buckets` (saved bucket = ordered list of template ids) with full
+  CRUD: `GET/POST/PUT/DELETE /api/buckets` and ownership re-validation on
+  both POST and PUT.
+- `POST /api/buckets/{id}/run` and `POST /api/buckets/run-once` execute the
+  contained templates **sequentially** against either the built-in simulator
+  or any saved connection profile. Each run gets a `bucket_run_id` that is
+  written onto every persisted log; `last_run_at` and `last_run_id` are
+  bumped on the bucket row so the user can jump to *Last run logs*.
+- `GET /api/logs` now accepts `bucket_run_id` to filter to a single batch.
+- `GET /api/logs/export` returns a `text/plain` attachment with one block
+  per log: human-readable timestamp + direction + MTI + RC, endpoint label,
+  optional template/bucket markers, parsed Data Elements rendered as
+  `DE002  Primary Account Number  n.19  4111…`, and the raw hex wrapped at
+  48 chars per row. Respects every existing filter plus `bucket_run_id`.
+- Frontend: new **Buckets** page (`/app/buckets`) with list + Run / Edit /
+  Delete / *Last run logs* per row, the **Edit** modal can reorder steps,
+  and a **Run** modal lets the user pick target + delay and shows a results
+  table on completion. Templates page now has multi-select checkboxes,
+  a sticky bottom toolbar with **Run as bucket** (one-shot) and **Save as
+  bucket**, and Logs page got an **Export .txt** button + a *bucket run*
+  filter chip.
+- New backend regression tests: `tests/test_buckets_and_export.py` (15 tests
+  covering CRUD validation, hydrated templates array order, reorder via PUT,
+  delay enforcement, run-once not touching `last_run_at`, log filter and
+  export header / DE / raw-hex format). 47/49 backend pytest green; the
+  remaining 2 are pre-existing live-WS smoke tests that flake when the
+  external sandbox doesn't echo back.
 
 ## Test credentials
 - Admin: `admin@iso8583.dev` / `admin12345` (Pro).
@@ -71,16 +105,17 @@ ISO-8583 payload to an external CBS endpoint.
 
 ## Prioritized backlog
 ### P1
-- CSV / NDJSON export of captured logs (Pro).
 - One-click *Replay* on any log row in Logs viewer.
 - External-endpoint configurator per-user (drop the URL into Settings).
+- Streaming / unbounded export for users with thousands of logs (current cap
+  is 5000 per export call).
 
 ### P2
 - Custom network-spec editor (users add networks + override fields).
 - Field-level validation (regex per `format` / `length_type`).
-- Team workspaces (shared templates).
-- Frontend: silence the rare React hydration warning about a `<span>` inside an
-  `<option>` (origin not yet identified — non-functional).
+- Team workspaces (shared templates / shared buckets).
+- Frontend: silence the rare React hydration warning about a `<span>` inside
+  an `<option>`.
 
 ## Code review (carry-over)
 - `server.py` — split into `routes/` modules once it crosses ~1500 lines.
