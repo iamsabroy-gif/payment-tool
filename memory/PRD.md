@@ -69,34 +69,57 @@ ISO-8583 payload to an external CBS endpoint.
   `POST /api/keys/arpc` → renders ARPC, ARC, SK KCV, F55 TLV with one-click
   *Insert as F55 (91 IAD)* into the Builder).
 
-### 2026-02 — Buckets + Logs export (this session)
+### 2026-02 — Buckets + Logs export
 - Added `db.buckets` (saved bucket = ordered list of template ids) with full
   CRUD: `GET/POST/PUT/DELETE /api/buckets` and ownership re-validation on
   both POST and PUT.
 - `POST /api/buckets/{id}/run` and `POST /api/buckets/run-once` execute the
   contained templates **sequentially** against either the built-in simulator
-  or any saved connection profile. Each run gets a `bucket_run_id` that is
-  written onto every persisted log; `last_run_at` and `last_run_id` are
-  bumped on the bucket row so the user can jump to *Last run logs*.
-- `GET /api/logs` now accepts `bucket_run_id` to filter to a single batch.
+  or any saved connection profile.
 - `GET /api/logs/export` returns a `text/plain` attachment with one block
-  per log: human-readable timestamp + direction + MTI + RC, endpoint label,
-  optional template/bucket markers, parsed Data Elements rendered as
-  `DE002  Primary Account Number  n.19  4111…`, and the raw hex wrapped at
-  48 chars per row. Respects every existing filter plus `bucket_run_id`.
-- Frontend: new **Buckets** page (`/app/buckets`) with list + Run / Edit /
-  Delete / *Last run logs* per row, the **Edit** modal can reorder steps,
-  and a **Run** modal lets the user pick target + delay and shows a results
-  table on completion. Templates page now has multi-select checkboxes,
-  a sticky bottom toolbar with **Run as bucket** (one-shot) and **Save as
-  bucket**, and Logs page got an **Export .txt** button + a *bucket run*
-  filter chip.
-- New backend regression tests: `tests/test_buckets_and_export.py` (15 tests
-  covering CRUD validation, hydrated templates array order, reorder via PUT,
-  delay enforcement, run-once not touching `last_run_at`, log filter and
-  export header / DE / raw-hex format). 47/49 backend pytest green; the
-  remaining 2 are pre-existing live-WS smoke tests that flake when the
-  external sandbox doesn't echo back.
+  per log: parsed Data Elements + raw hex wrapped at 48 chars per row.
+- Frontend: new **Buckets** page (`/app/buckets`); Templates page got a
+  multi-select toolbar with *Run as bucket* / *Save as bucket*; Logs got an
+  **Export .txt** button + bucket-run filter chip.
+
+### 2026-02 — User-defined specs + Builder spec hints (this session)
+- New `db.user_specs` collection (unique on `(user_id, network_id)`). Full
+  CRUD at `/api/user-specs`, with `/api/user-specs/import` accepting either
+  CSV (`csv_text`) or full JSON (`payload`), and a public CSV starter at
+  `/api/user-specs/template`. Built-in network ids (visa/mastercard/amex/
+  rupay) are reserved.
+- `iso8583.register_runtime_spec` lazily hydrates user specs into the
+  in-memory `NETWORK_SPECS` registry on every preview / send / validate
+  call (`_ensure_user_spec_loaded`). User spec ids are namespaced as
+  `user:<slug>` to avoid collisions.
+- `iso8583.build_user_spec` validates + normalises a lightweight import
+  payload into the runtime-ready spec shape; `parse_spec_csv` understands
+  the documented header `field,name,format,length_type,max_length,encoding,
+  length_encoding`.
+- `iso8583.mandatory_catalog(network_id)` returns `{<mti>: [DEs]}` for the
+  Builder spec-hint UI; built-in entries live in `MANDATORY_PER_MTI` and
+  user specs ship their own per-MTI map.
+- New endpoint `GET /api/specs/{network_id}/mandatory` and `/api/specs`
+  now lists built-in + user-owned (each tagged with `builtin: true|false`).
+- **Builder UX** (`/app/builder`): bitmap tiles for fields that are
+  mandatory for the current MTI render with a red dot indicator and a
+  red ring when the field is missing (not active OR empty). Active DE
+  rows display a `REQ` badge, and an inline lint error appears in red
+  under the input when the value violates `format` (`n` numeric, `b`
+  hex, `ans` length) or exceeds `max_length`. Header banner shows the
+  count of missing-required fields. Network dropdown groups options
+  under *Built-in* / *Custom* optgroups.
+- **New page** `/app/specs` — list / create / edit / delete user specs.
+  Editor has a Header form (encodings) + Fields tab (add/remove/edit DE
+  catalogue rows) + Mandatory-per-MTI tab (toggle which DEs are required
+  per MTI). Import modal supports both CSV file/textarea and JSON
+  file/textarea, and a CSV-template download is one click away on the
+  page header. AppShell sidebar got a *Specs* nav.
+- New backend regression tests: `tests/test_user_specs.py` (19 tests
+  covering CRUD validation, reserved-id rejection, CSV/JSON import,
+  immutability of `network_id` on PUT, /specs hydration, preview/send
+  on user specs, and DELETE unregistration). Backend pytest 67/68
+  green; the carry-over flake is the external WS sandbox round-trip.
 
 ## Test credentials
 - Admin: `admin@iso8583.dev` / `admin12345` (Pro).

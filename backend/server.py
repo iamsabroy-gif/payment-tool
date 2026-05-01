@@ -582,13 +582,16 @@ async def update_user_spec(spec_id: str, body: UserSpecCreate, user=Depends(get_
     existing = await db.user_specs.find_one({"id": spec_id, "user_id": user["id"]}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Spec not found")
+    # disallow renaming the network_id under the user (would invalidate templates)
+    submitted_nid = (body.network_id or "").strip().lower()
+    if submitted_nid and not submitted_nid.startswith("user:"):
+        submitted_nid = f"user:{submitted_nid}"
+    if submitted_nid and submitted_nid != existing["network_id"]:
+        raise HTTPException(status_code=400, detail="network_id cannot change after create")
     try:
         spec = build_user_spec(body.model_dump())
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    # disallow renaming the network_id under the user (would invalidate templates)
-    if spec["network_id"] != existing["network_id"]:
-        raise HTTPException(status_code=400, detail="network_id cannot change after create")
     update = {
         "name": spec["name"],
         "description": spec["description"],
