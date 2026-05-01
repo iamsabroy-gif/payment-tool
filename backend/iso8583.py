@@ -219,6 +219,33 @@ def _spec(network_id: str) -> Dict:
     return NETWORK_SPECS.get(network_id) or NETWORK_SPECS["visa"]
 
 
+_ASCII_OVERRIDES = {
+    "mti_encoding": "ascii",
+    "bitmap_encoding": "ascii_hex",
+    "default_an_charset": "ascii",
+    "length_prefix_encoding": "ascii",
+}
+
+
+def _resolve_spec(network_id: str, wire_format: str = "native") -> Dict:
+    """Return a spec view, optionally with ASCII-compat overrides applied."""
+    base = _spec(network_id)
+    if wire_format != "ascii":
+        return base
+    spec = dict(base)
+    spec.update(_ASCII_OVERRIDES)
+    fields = _build_network_fields(
+        "ascii", "ascii",
+        {f: meta["name"] for f, meta in base["fields"].items()},
+    )
+    # ASCII-compat additionally forces numeric fields to ASCII (not BCD).
+    for f, meta in fields.items():
+        if meta["format"] == "n":
+            meta["encoding"] = "ascii"
+    spec["fields"] = fields
+    return spec
+
+
 def _encode_field(value: str, meta: Dict) -> bytes:
     fmt = meta["format"]
     enc = meta["encoding"]
@@ -302,12 +329,13 @@ def _decode_length_prefix(data: bytes, offset: int, length_type: str, length_enc
     return v, n_bytes
 
 
-def encode_message(mti: str, data_elements: Dict[str, str], network_id: str = "visa") -> Tuple[str, Dict]:
-    """Encode a message per network spec. Returns (raw_hex, parsed_meta)."""
+def encode_message(mti: str, data_elements: Dict[str, str], network_id: str = "visa", wire_format: str = "native") -> Tuple[str, Dict]:
+    """Encode a message per network spec. Returns (raw_hex, parsed_meta).
+    `wire_format`: 'native' (per-network binary/EBCDIC) or 'ascii' (full ASCII compat)."""
     if not (len(mti) == 4 and mti.isdigit()):
         raise ValueError("MTI must be 4 numeric digits")
 
-    spec = _spec(network_id)
+    spec = _resolve_spec(network_id, wire_format)
     fields_spec = spec["fields"]
 
     normalised: Dict[int, str] = {}
@@ -416,8 +444,8 @@ def _decode_field(data: bytes, offset: int, meta: Dict) -> Tuple[str, int, dict]
     return value, prefix_size + body_size, extras
 
 
-def decode_message(raw_hex: str, network_id: str = "visa") -> Dict:
-    spec = _spec(network_id)
+def decode_message(raw_hex: str, network_id: str = "visa", wire_format: str = "native") -> Dict:
+    spec = _resolve_spec(network_id, wire_format)
     fields_spec = spec["fields"]
     data = bytes.fromhex(raw_hex)
     pos = 0

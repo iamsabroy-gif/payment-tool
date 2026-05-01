@@ -194,13 +194,23 @@ class CheckoutRequest(BaseModel):
 
 class ConnectionProfileIn(BaseModel):
     name: str
-    host: str
-    port: int = Field(ge=1, le=65535)
+    transport: str = "tcp"            # "tcp" | "websocket"
+    # TCP fields
+    host: Optional[str] = None
+    port: Optional[int] = Field(default=None, ge=1, le=65535)
+    # WebSocket fields
+    ws_url: Optional[str] = None
+    auth_login_url: Optional[str] = None
+    auth_username: Optional[str] = None
+    auth_password: Optional[str] = None
+    ws_text_mode: bool = False         # send hex text frames instead of binary
+    # shared
     length_header: str = Field(default="2_byte")
     use_tls: bool = False
     timeout_sec: float = 10.0
     auto_heartbeat: bool = False
     heartbeat_interval_sec: int = 30
+    wire_format: str = "native"        # "native" | "ascii"
     description: Optional[str] = None
 
 
@@ -641,7 +651,9 @@ async def keys_arpc(body: ArpcRequest, _user=Depends(get_current_user)):
 # ---------------------------------------------------------------------------
 @api.get("/connections")
 async def list_connections(user=Depends(get_current_user)):
-    docs = await db.connection_profiles.find({"user_id": user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    docs = await db.connection_profiles.find(
+        {"user_id": user["id"]}, {"_id": 0, "auth_password": 0}
+    ).sort("created_at", -1).to_list(200)
     return docs
 
 
@@ -649,23 +661,39 @@ async def list_connections(user=Depends(get_current_user)):
 async def create_connection(body: ConnectionProfileIn, user=Depends(get_current_user)):
     if body.length_header not in LENGTH_HEADERS:
         raise HTTPException(status_code=400, detail=f"length_header must be one of {LENGTH_HEADERS}")
+    if body.transport not in ("tcp", "websocket"):
+        raise HTTPException(status_code=400, detail="transport must be 'tcp' or 'websocket'")
+    if body.transport == "tcp" and not (body.host and body.port):
+        raise HTTPException(status_code=400, detail="TCP profiles require host and port")
+    if body.transport == "websocket" and not body.ws_url:
+        raise HTTPException(status_code=400, detail="WebSocket profiles require ws_url")
+    if body.length_header not in LENGTH_HEADERS:
+        raise HTTPException(status_code=400, detail=f"length_header must be one of {LENGTH_HEADERS}")
     doc = {
         "id": str(uuid.uuid4()),
         "user_id": user["id"],
         "name": body.name,
-        "host": body.host.strip(),
+        "transport": body.transport,
+        "host": (body.host or "").strip(),
         "port": body.port,
+        "ws_url": (body.ws_url or "").strip(),
+        "auth_login_url": (body.auth_login_url or "").strip(),
+        "auth_username": (body.auth_username or "").strip(),
+        "auth_password": body.auth_password or "",
+        "ws_text_mode": body.ws_text_mode,
         "length_header": body.length_header,
         "use_tls": body.use_tls,
         "timeout_sec": body.timeout_sec,
         "auto_heartbeat": body.auto_heartbeat,
         "heartbeat_interval_sec": body.heartbeat_interval_sec,
+        "wire_format": body.wire_format,
         "description": body.description or "",
         "created_at": now_iso(),
         "updated_at": now_iso(),
     }
     await db.connection_profiles.insert_one(doc)
     doc.pop("_id", None)
+    doc.pop("auth_password", None)  # never echo back the password
     return doc
 
 
@@ -673,24 +701,32 @@ async def create_connection(body: ConnectionProfileIn, user=Depends(get_current_
 async def update_connection(conn_id: str, body: ConnectionProfileIn, user=Depends(get_current_user)):
     if body.length_header not in LENGTH_HEADERS:
         raise HTTPException(status_code=400, detail=f"length_header must be one of {LENGTH_HEADERS}")
+    update = {
+        "name": body.name,
+        "transport": body.transport,
+        "host": (body.host or "").strip(),
+        "port": body.port,
+        "ws_url": (body.ws_url or "").strip(),
+        "auth_login_url": (body.auth_login_url or "").strip(),
+        "auth_username": (body.auth_username or "").strip(),
+        "ws_text_mode": body.ws_text_mode,
+        "length_header": body.length_header,
+        "use_tls": body.use_tls,
+        "timeout_sec": body.timeout_sec,
+        "auto_heartbeat": body.auto_heartbeat,
+        "heartbeat_interval_sec": body.heartbeat_interval_sec,
+        "wire_format": body.wire_format,
+        "description": body.description or "",
+        "updated_at": now_iso(),
+    }
+    if body.auth_password:
+        update["auth_password"] = body.auth_password
     res = await db.connection_profiles.update_one(
-        {"id": conn_id, "user_id": user["id"]},
-        {"$set": {
-            "name": body.name,
-            "host": body.host.strip(),
-            "port": body.port,
-            "length_header": body.length_header,
-            "use_tls": body.use_tls,
-            "timeout_sec": body.timeout_sec,
-            "auto_heartbeat": body.auto_heartbeat,
-            "heartbeat_interval_sec": body.heartbeat_interval_sec,
-            "description": body.description or "",
-            "updated_at": now_iso(),
-        }},
+        {"id": conn_id, "user_id": user["id"]}, {"$set": update}
     )
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Connection profile not found")
-    doc = await db.connection_profiles.find_one({"id": conn_id}, {"_id": 0})
+    doc = await db.connection_profiles.find_one({"id": conn_id}, {"_id": 0, "auth_password": 0})
     return doc
 
 
@@ -741,11 +777,10 @@ async def connection_status(conn_id: str, user=Depends(get_current_user)):
 
 @api.post("/iso/send-tcp")
 async def send_over_tcp_endpoint(body: TcpSendRequest, user=Depends(get_current_user)):
-    """Encode an ISO-8583 message and send it over TCP (optionally TLS) to a
-    user-configured CBS host. Request & response are both persisted as logs."""
+    """Encode an ISO-8583 message and send it over the profile's transport
+    (raw TCP or WebSocket). Request & response are both persisted as logs."""
     await enforce_log_quota(user)
 
-    # Resolve connection settings
     host = body.host
     port = body.port
     length_header = body.length_header or "2_byte"
@@ -753,19 +788,26 @@ async def send_over_tcp_endpoint(body: TcpSendRequest, user=Depends(get_current_
     timeout_sec = float(body.timeout_sec) if body.timeout_sec else 10.0
     conn_name = None
     use_persistent = False
+    transport = "tcp"
+    wire_format = "native"
+    endpoint_label = ""
     if body.connection_id:
         conn = await db.connection_profiles.find_one(
             {"id": body.connection_id, "user_id": user["id"]}, {"_id": 0}
         )
         if not conn:
             raise HTTPException(status_code=404, detail="Connection profile not found")
-        host = conn["host"]
-        port = conn["port"]
+        transport = conn.get("transport", "tcp")
         length_header = conn["length_header"]
-        use_tls = bool(conn.get("use_tls"))
         timeout_sec = float(conn.get("timeout_sec") or 10.0)
+        wire_format = conn.get("wire_format", "native")
         conn_name = conn["name"]
-        # Require an active session — don't silently open a one-off socket.
+        if transport == "tcp":
+            host = conn.get("host"); port = conn.get("port")
+            use_tls = bool(conn.get("use_tls"))
+            endpoint_label = f"tcp{'s' if use_tls else ''}://{host}:{port} [{length_header}]"
+        else:
+            endpoint_label = f"{conn['ws_url']} [ws · {length_header} · {wire_format}]"
         if not session_is_connected(body.connection_id):
             raise HTTPException(
                 status_code=409,
@@ -773,18 +815,20 @@ async def send_over_tcp_endpoint(body: TcpSendRequest, user=Depends(get_current_
             )
         use_persistent = True
 
-    if not host or not port:
-        raise HTTPException(status_code=400, detail="host and port are required")
+    if not use_persistent:
+        if not host or not port:
+            raise HTTPException(status_code=400, detail="host and port are required")
+        endpoint_label = f"tcp{'s' if use_tls else ''}://{host}:{port} [{length_header}]"
+
     if length_header not in LENGTH_HEADERS:
         raise HTTPException(status_code=400, detail=f"length_header must be one of {LENGTH_HEADERS}")
 
     try:
-        req_hex, req_meta = encode_message(body.mti, body.data_elements, body.network_id)
+        req_hex, req_meta = encode_message(body.mti, body.data_elements, body.network_id, wire_format=wire_format)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
     outbound_id = str(uuid.uuid4())
-    endpoint_label = f"tcp{'s' if use_tls else ''}://{host}:{port} [{length_header}]"
     outbound_log = {
         "id": outbound_id,
         "user_id": user["id"],
@@ -800,26 +844,22 @@ async def send_over_tcp_endpoint(body: TcpSendRequest, user=Depends(get_current_
         "endpoint_url": endpoint_label,
         "connection_id": body.connection_id,
         "connection_name": conn_name,
+        "transport": transport,
+        "wire_format": wire_format,
     }
 
-    # Fire the socket (persistent session for saved profiles, one-off for ad-hoc)
     try:
         body_bytes = bytes.fromhex(req_hex)
         if use_persistent:
             framed, response_bytes = await send_on_session(body.connection_id, body_bytes)
         else:
             framed, response_bytes = await send_over_tcp(
-                host=host,
-                port=port,
-                body=body_bytes,
-                length_header=length_header,
-                use_tls=use_tls,
-                timeout=timeout_sec,
+                host=host, port=port, body=body_bytes,
+                length_header=length_header, use_tls=use_tls, timeout=timeout_sec,
             )
         resp_hex = response_bytes.hex().upper()
-        # Attempt to decode if response looks like ASCII ISO-8583
         try:
-            resp_meta = decode_message(resp_hex, body.network_id)
+            resp_meta = decode_message(resp_hex, body.network_id, wire_format=wire_format)
             rc = "??"
             for fobj in resp_meta.get("fields", []):
                 if fobj["field"] == 39:
@@ -832,21 +872,12 @@ async def send_over_tcp_endpoint(body: TcpSendRequest, user=Depends(get_current_
             rc = "??"
         tcp_error = None
     except (asyncio.TimeoutError, TimeoutError) as e:
-        resp_hex = ""
-        resp_meta = {"error": f"timeout after {timeout_sec}s contacting {host}:{port}"}
-        rc = "91"  # Issuer unavailable — closest standard code for timeout
-        tcp_error = str(e) or "timeout"
+        resp_hex = ""; resp_meta = {"error": f"timeout after {timeout_sec}s"}; rc = "91"; tcp_error = str(e) or "timeout"
     except (ConnectionRefusedError, OSError) as e:
-        resp_hex = ""
-        resp_meta = {"error": f"connection failed: {e}"}
-        rc = "96"  # System malfunction
-        tcp_error = str(e)
+        resp_hex = ""; resp_meta = {"error": f"connection failed: {e}"}; rc = "96"; tcp_error = str(e)
     except Exception as e:
-        logger.exception("TCP send failed: %s", e)
-        resp_hex = ""
-        resp_meta = {"error": str(e)}
-        rc = "96"
-        tcp_error = str(e)
+        logger.exception("send failed: %s", e)
+        resp_hex = ""; resp_meta = {"error": str(e)}; rc = "96"; tcp_error = str(e)
 
     inbound_id = str(uuid.uuid4())
     inbound_log = {
@@ -864,14 +895,14 @@ async def send_over_tcp_endpoint(body: TcpSendRequest, user=Depends(get_current_
         "endpoint_url": endpoint_label,
         "connection_id": body.connection_id,
         "connection_name": conn_name,
+        "transport": transport,
+        "wire_format": wire_format,
         "error": tcp_error,
     }
     outbound_log["related_id"] = inbound_id
     outbound_log["status_code"] = rc
-
     await db.transaction_logs.insert_many([outbound_log, inbound_log])
-    for doc in (outbound_log, inbound_log):
-        doc.pop("_id", None)
+    for d in (outbound_log, inbound_log): d.pop("_id", None)
 
     return {
         "outbound": outbound_log,
