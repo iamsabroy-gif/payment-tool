@@ -280,6 +280,79 @@ function ArqcTab({ builderState, onInsertField, onClose }) {
     );
 }
 
+// ----------------------------- ARPC ------------------------------------
+function ArpcTab({ onInsertField, onClose }) {
+    const [sk, setSk] = useState("0123456789ABCDEFFEDCBA9876543210");
+    const [arqc, setArqc] = useState("");
+    const [arc, setArc] = useState("3030");
+    const [algo, setAlgo] = useState("3DES");
+    const [res, setRes] = useState(null);
+    const [busy, setBusy] = useState(false);
+
+    const compute = async () => {
+        setBusy(true);
+        try {
+            const { data } = await api.post("/keys/arpc", {
+                sk_hex: sk, arqc_hex: arqc, arc_hex: arc, algorithm: algo,
+            });
+            setRes(data);
+        } catch (e) { toast.error(apiErr(e)); }
+        finally { setBusy(false); }
+    };
+
+    const insertF55 = () => {
+        if (!res) return;
+        onInsertField?.(55, res.f55_tlv_hex);
+        toast.success("F55 populated with 91 IAD (ARPC || ARC)");
+        onClose?.();
+    };
+
+    return (
+        <>
+            <p className="text-xs text-[#4B5563]">
+                Issuer ARPC (Method 1): <code className="font-mono">encrypt(SK, ARQC XOR (ARC || 00…))</code>.
+                Paste the session key (SK_AC) — usually derived from MDK on the issuer side — plus the ARQC the
+                terminal sent and a 2-byte authorisation response code (ARC). 3030 = ASCII "00" = approved.
+            </p>
+            <div className="grid grid-cols-3 gap-3">
+                <Field label="Algorithm">
+                    <select data-testid="arpc-algo-select" value={algo} onChange={(e) => setAlgo(e.target.value)} className="w-full h-9 border border-gray-300 px-2 text-sm bg-white">
+                        <option value="3DES">3DES</option>
+                        <option value="AES">AES</option>
+                    </select>
+                </Field>
+                <div className="col-span-2">
+                    <Field label="Session Key (SK_AC, 16/24/32 bytes hex)">
+                        <input data-testid="arpc-sk" value={sk} onChange={(e) => setSk(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
+                    </Field>
+                </div>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+                <Field label="ARQC (8 bytes hex for 3DES)">
+                    <input data-testid="arpc-arqc" value={arqc} onChange={(e) => setArqc(e.target.value.toUpperCase())} placeholder="e.g. 1A2B3C4D5E6F7081" className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
+                </Field>
+                <Field label="ARC (2 bytes hex; '3030' = '00' approved)">
+                    <input data-testid="arpc-arc" value={arc} maxLength={4} onChange={(e) => setArc(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
+                </Field>
+            </div>
+            <button onClick={compute} disabled={busy || !arqc} data-testid="arpc-compute-btn" className="h-9 px-4 border border-[#002FA7] text-[#002FA7] text-xs font-semibold hover:bg-[#F3F4F6] disabled:opacity-50">
+                {busy ? "Computing…" : "Compute ARPC"}
+            </button>
+            {res && (
+                <div className="border border-[#E5E7EB] bg-[#F9FAFB] p-3 space-y-2 text-xs" data-testid="arpc-result">
+                    <ResultLine label="ARPC"        value={res.arpc_hex}        accent testid="arpc-value" />
+                    <ResultLine label="ARC"         value={res.arc_hex}                testid="arpc-arc-out" />
+                    <ResultLine label="SK KCV"      value={res.session_key_kcv}        testid="arpc-sk-kcv" />
+                    <ResultLine label="F55 TLV"     value={res.f55_tlv_hex}            testid="arpc-f55-tlv" />
+                    <button onClick={insertF55} data-testid="arpc-insert-f55" className="h-9 px-4 bg-[#002FA7] text-white text-xs font-semibold hover:bg-[#002080] flex items-center gap-2">
+                        Insert as F55 (91 IAD) <ArrowRight size={12} weight="bold" />
+                    </button>
+                </div>
+            )}
+        </>
+    );
+}
+
 // ----------------------------- shared ------------------------------------
 const Field = ({ label, children }) => (
     <label className="block">
