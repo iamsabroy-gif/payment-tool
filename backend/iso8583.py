@@ -137,6 +137,7 @@ NETWORK_SPECS: Dict[str, Dict] = {
         "bitmap_encoding": "binary",
         "default_an_charset": "ebcdic",
         "length_prefix_encoding": "bcd",
+        "builtin": True,
         "fields": _build_network_fields(
             "ebcdic", "bcd",
             {18: "Merchant Category Code (MCC)", 62: "VISA Private Use", 63: "VISA Network Data"},
@@ -150,6 +151,7 @@ NETWORK_SPECS: Dict[str, Dict] = {
         "bitmap_encoding": "binary",
         "default_an_charset": "ebcdic",
         "length_prefix_encoding": "bcd",
+        "builtin": True,
         "fields": _build_network_fields(
             "ebcdic", "bcd",
             {48: "Mastercard Additional Data", 61: "Mastercard POS Extended", 63: "Mastercard Network Data"},
@@ -163,6 +165,7 @@ NETWORK_SPECS: Dict[str, Dict] = {
         "bitmap_encoding": "binary",
         "default_an_charset": "ebcdic",
         "length_prefix_encoding": "bcd",
+        "builtin": True,
         "fields": _build_network_fields(
             "ebcdic", "bcd",
             {62: "AMEX Transaction Identifier", 63: "AMEX Reserved Private"},
@@ -176,6 +179,7 @@ NETWORK_SPECS: Dict[str, Dict] = {
         "bitmap_encoding": "binary",
         "default_an_charset": "ascii",
         "length_prefix_encoding": "bcd",
+        "builtin": True,
         "fields": _build_network_fields(
             "ascii", "bcd",
             {18: "MCC", 32: "Acquiring BIN", 49: "Currency (356 = INR)",
@@ -210,6 +214,31 @@ MANDATORY_PER_MTI: Dict[str, Dict[str, set]] = {
     "amex":       dict(_COMMON_MANDATORY),
     "rupay":      dict(_COMMON_MANDATORY),
 }
+
+
+# ===========================================================================
+# Runtime spec registry (user-defined specs are registered on demand)
+# ===========================================================================
+def register_runtime_spec(spec: Dict) -> None:
+    """Insert a user-defined spec into the in-memory registry.
+
+    Idempotent: same `network_id` overwrites previous entry. The caller
+    is expected to provide a fully-built spec dict matching the shape of
+    the entries in NETWORK_SPECS (i.e. with `fields` already projected).
+    """
+    nid = spec.get("network_id")
+    if not nid:
+        raise ValueError("spec missing network_id")
+    NETWORK_SPECS[nid] = spec
+    if "mandatory_per_mti" in spec:
+        MANDATORY_PER_MTI[nid] = {
+            mti: set(int(f) for f in fnums)
+            for mti, fnums in spec["mandatory_per_mti"].items()
+        }
+
+
+def known_network_ids() -> List[str]:
+    return list(NETWORK_SPECS.keys())
 
 
 # ===========================================================================
@@ -568,6 +597,157 @@ def field_catalog(network_id: str = "visa") -> List[Dict]:
         {"field": f, **{k: v for k, v in meta.items() if k != "encoding" or True}}
         for f, meta in sorted(spec["fields"].items())
     ]
+
+
+def mandatory_catalog(network_id: str = "visa") -> Dict[str, List[int]]:
+    """Return `{mti: [field_numbers...]}` for the Builder spec-hint UI."""
+    table = MANDATORY_PER_MTI.get(network_id, MANDATORY_PER_MTI.get("visa", {}))
+    return {mti: sorted(set(int(f) for f in fset)) for mti, fset in table.items()}
+
+
+# ---------------------------------------------------------------------------
+# Custom user spec builder — turns lightweight import payload into a full
+# spec dict ready for `register_runtime_spec`.
+# ---------------------------------------------------------------------------
+_VALID_FORMATS = {"n", "an", "ans", "b", "z"}
+_VALID_LENGTH_TYPES = {"fixed", "LLVAR", "LLLVAR"}
+_VALID_AN_CHARSETS = {"ascii", "ebcdic"}
+_VALID_LENGTH_PREFIX_ENCODINGS = {"ascii", "bcd"}
+_VALID_BITMAP_ENCODINGS = {"binary", "ascii_hex"}
+_VALID_MTI_ENCODINGS = {"ascii", "bcd"}
+
+
+def build_user_spec(payload: Dict) -> Dict:
+    """Validate + normalise a user-supplied spec into the runtime-ready shape.
+
+    Required keys: `network_id` (slug, will be prefixed with `user:`), `name`.
+    Optional encoding params default to ASCII-friendly values, which is the
+    most common shape for sandboxes.
+    The `fields` value is a dict ``{ "<field_num>": {name, format, length_type, max_length, encoding?} }``.
+    `mandatory_per_mti` is ``{ "0200": [2, 3, 4, ...], ... }``.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("spec payload must be a JSON object")
+    raw_id = (payload.get("network_id") or "").strip().lower()
+    if not raw_id or not all(c.isalnum() or c in "-_" for c in raw_id):
+        raise ValueError("network_id must be a slug (a-z, 0-9, -, _)")
+    if raw_id in {"visa", "mastercard", "amex", "rupay"}:
+        raise ValueError(f"network_id '{raw_id}' is reserved for the built-in spec")
+    network_id = raw_id if raw_id.startswith("user:") else f"user:{raw_id}"
+
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise ValueError("name is required")
+
+    mti_enc = (payload.get("mti_encoding") or "ascii").lower()
+    bitmap_enc = (payload.get("bitmap_encoding") or "ascii_hex").lower()
+    an_charset = (payload.get("default_an_charset") or "ascii").lower()
+    len_prefix_enc = (payload.get("length_prefix_encoding") or "ascii").lower()
+    if mti_enc not in _VALID_MTI_ENCODINGS:
+        raise ValueError(f"mti_encoding must be one of {sorted(_VALID_MTI_ENCODINGS)}")
+    if bitmap_enc not in _VALID_BITMAP_ENCODINGS:
+        raise ValueError(f"bitmap_encoding must be one of {sorted(_VALID_BITMAP_ENCODINGS)}")
+    if an_charset not in _VALID_AN_CHARSETS:
+        raise ValueError(f"default_an_charset must be one of {sorted(_VALID_AN_CHARSETS)}")
+    if len_prefix_enc not in _VALID_LENGTH_PREFIX_ENCODINGS:
+        raise ValueError(f"length_prefix_encoding must be one of {sorted(_VALID_LENGTH_PREFIX_ENCODINGS)}")
+
+    # Start from BASE_FIELDS (so the user inherits the ISO catalogue), then
+    # apply per-field overrides supplied in the payload.
+    fields = _build_network_fields(an_charset, len_prefix_enc, {})
+    raw_fields = payload.get("fields") or {}
+    if not isinstance(raw_fields, dict):
+        raise ValueError("fields must be a dict keyed by field number")
+    for k, override in raw_fields.items():
+        try:
+            fnum = int(k)
+        except (TypeError, ValueError):
+            raise ValueError(f"field key '{k}' is not an integer")
+        if not (1 <= fnum <= 128):
+            raise ValueError(f"field {fnum} is outside the 1–128 range")
+        if not isinstance(override, dict):
+            raise ValueError(f"field {fnum} override must be an object")
+        cell = dict(fields.get(fnum) or {})
+        cell["name"] = (override.get("name") or cell.get("name") or f"Field {fnum}").strip()
+        cell["format"] = (override.get("format") or cell.get("format") or "ans").lower()
+        if cell["format"] not in _VALID_FORMATS:
+            raise ValueError(f"field {fnum}: format must be one of {sorted(_VALID_FORMATS)}")
+        cell["length_type"] = override.get("length_type") or cell.get("length_type") or "fixed"
+        if cell["length_type"] not in _VALID_LENGTH_TYPES:
+            raise ValueError(f"field {fnum}: length_type must be one of {sorted(_VALID_LENGTH_TYPES)}")
+        try:
+            cell["max_length"] = int(override.get("max_length") or cell.get("max_length") or 0)
+        except (TypeError, ValueError):
+            raise ValueError(f"field {fnum}: max_length must be an integer")
+        if cell["max_length"] <= 0 or cell["max_length"] > 999:
+            raise ValueError(f"field {fnum}: max_length must be 1..999")
+        cell["encoding"] = (override.get("encoding") or _default_encoding(cell["format"], an_charset)).lower()
+        cell["length_encoding"] = (override.get("length_encoding") or len_prefix_enc).lower()
+        fields[fnum] = cell
+
+    # Mandatory per MTI
+    raw_mandatory = payload.get("mandatory_per_mti") or {}
+    if not isinstance(raw_mandatory, dict):
+        raise ValueError("mandatory_per_mti must be a dict")
+    mandatory: Dict[str, List[int]] = {}
+    for mti, flist in raw_mandatory.items():
+        if not (isinstance(mti, str) and len(mti) == 4 and mti.isdigit()):
+            raise ValueError(f"mandatory_per_mti key '{mti}' is not a 4-digit MTI string")
+        try:
+            mandatory[mti] = sorted(set(int(f) for f in flist or []))
+        except (TypeError, ValueError):
+            raise ValueError(f"mandatory_per_mti[{mti}] must be a list of integers")
+        for fnum in mandatory[mti]:
+            if fnum not in fields:
+                raise ValueError(f"mandatory_per_mti[{mti}] references unknown field {fnum}")
+
+    return {
+        "network_id": network_id,
+        "name": name,
+        "description": (payload.get("description") or "").strip(),
+        "mti_encoding": mti_enc,
+        "bitmap_encoding": bitmap_enc,
+        "default_an_charset": an_charset,
+        "length_prefix_encoding": len_prefix_enc,
+        "builtin": False,
+        "fields": fields,
+        "mandatory_per_mti": mandatory,
+    }
+
+
+def parse_spec_csv(text: str) -> Dict[str, Dict]:
+    """Parse a CSV table of field overrides.
+
+    Header row (case-insensitive):
+        field,name,format,length_type,max_length,encoding,length_encoding
+    Returns a `{ "<field_num>": {…} }` dict suitable for `build_user_spec`.
+    """
+    import csv
+    import io
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise ValueError("CSV is empty / missing header")
+    expected = {"field", "name", "format", "length_type", "max_length"}
+    have = {(c or "").strip().lower() for c in reader.fieldnames}
+    missing = expected - have
+    if missing:
+        raise ValueError(f"CSV header missing column(s): {sorted(missing)}")
+    out: Dict[str, Dict] = {}
+    for row in reader:
+        norm = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+        if not norm.get("field"):
+            continue
+        out[norm["field"]] = {
+            "name": norm.get("name", ""),
+            "format": norm.get("format", "ans"),
+            "length_type": norm.get("length_type", "fixed"),
+            "max_length": norm.get("max_length", "0"),
+            "encoding": norm.get("encoding") or None,
+            "length_encoding": norm.get("length_encoding") or None,
+        }
+    if not out:
+        raise ValueError("CSV had a header but no data rows")
+    return out
 
 
 def hex_to_base64(raw_hex: str) -> str:

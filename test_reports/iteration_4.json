@@ -1,0 +1,53 @@
+{
+  "summary": "Iteration_4 — Phase A (Builder spec hints) + Phase B (user-defined custom network specs). Created /app/backend/tests/test_user_specs.py (19 tests, 100% green) covering full user-spec lifecycle: CRUD + reserved-id rejection (visa/mastercard/amex/rupay → 400), duplicate (409), CSV/JSON import, public CSV template, /api/specs built-in+custom listing, /api/specs/{nid}/fields and /mandatory hydration, /api/iso/preview round-trip on user spec, validation_errors include 'mandatory' for missing DEs, /api/iso/send writes outbound+inbound logs against user spec, and DELETE unregisters the spec from /api/specs. Full pytest suite: 67/68 PASSED (98.5%). Sole failure is the pre-existing carryover from iteration_3 — test_send_tcp_over_ws_roundtrip flakes against the upstream wss://iso8583-server.emergent.host sandbox (no 0810 returned, external blip, not a regression). Frontend Playwright run on the public REACT_APP_BACKEND_URL: login OK, sidebar shows new 'Specs' nav between Buckets and Logs (data-testid='nav-specs'), /app/specs page renders with CSV template / Import / New spec buttons (all data-testid'd: specs-download-template, specs-import-btn, specs-new-btn, specs-list, spec-row-/edit-/delete-{id}), Spec Editor modal opens with NETWORK ID, NAME, DESCRIPTION, MTI/bitmap/AN charset/length-prefix selectors and Fields(0) + Mandatory per MTI(0) tabs and Create spec CTA. Builder page (visa, MTI 0200) shows red '8 required fields missing for 0200' banner and exactly the 8 mandatory tiles (#2 #3 #4 #7 #11 #41 #42 #49) carry data-mandatory='true' with red ring + dot indicator — matches the spec hint requirement exactly.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/user-specs/import", "issue": "When body contains both csv_text and payload, returns 400 'Provide either ... not both' — works, but Pydantic-side validator would surface it earlier (cosmetic)."},
+      {"endpoint": "DELETE /api/user-specs/{id}", "issue": "Hard-removes from in-memory NETWORK_SPECS, but if another user (or another pod) has the same network_id loaded, they keep working until their own _ensure_user_spec_loaded re-hydrates (per-user scoping is correct, just noting)."},
+      {"endpoint": "PUT /api/user-specs/{id}", "issue": "build_user_spec ignores raw_id == reserved 'visa' before the network_id-immutability check — a user updating with reserved id gets the reserved-id error instead of the immutability error (order-of-validation nit)."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Carry-over from iter_2/iter_3", "issues": ["React hydration warning '<span> cannot be a child of <option>' still present in select controls (originating in App.js → ProtectedRoute subtree). Repro on every page load."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_user_specs.py",
+    "/app/backend/tests/test_buckets_and_export.py",
+    "/app/backend/tests/test_iso8583_codecs.py",
+    "/app/backend/tests/test_new_features.py",
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/test_reports/pytest/pytest_user_specs.xml"
+  ],
+  "action_items": [
+    "(carry-over) Fix the React '<span> in <option>' hydration warning — likely the network select in Builder.jsx renders a <span class=...> inside <option>. Replace with plain text or use a custom listbox.",
+    "(low) Reorder validation in build_user_spec so that 'network_id cannot change' wins over 'reserved id' when both apply on PUT.",
+    "(low) The flaky external WS test (test_send_tcp_over_ws_roundtrip) should mark itself xfail when the sandbox is unreachable rather than fail the suite; consider a soft skip on response timeout."
+  ],
+  "critical_code_review_comments": [
+    "server.py L440-453: _ensure_user_spec_loaded re-builds and re-registers the spec on every preview/send/validate call. Fine for correctness, but for hot paths a tiny LRU cache keyed by (user_id, network_id, updated_at) would avoid the rebuild. Not a blocker.",
+    "server.py L513-541: create_user_spec stores body.fields raw (not the normalised resolved fields from build_user_spec). On hydrate it re-normalises via build_user_spec. Documented in comment, just confirming it round-trips correctly (verified via test_update_user_spec).",
+    "server.py L580-606: PUT path runs build_user_spec on the new payload BEFORE comparing network_id — a payload referencing a reserved id (e.g. 'visa') will 400 with 'reserved' rather than 'network_id cannot change'. Both are 400, so cosmetically fine.",
+    "server.py L609-616: delete_user_spec pops from NETWORK_SPECS unconditionally — if a user spec slug collides with a future built-in name added later, the pop could remove the wrong entry. Today raw_id is forced to 'user:<slug>' so safe.",
+    "iso8583.py L718-750: parse_spec_csv uses csv.DictReader without quoting='strict'; a malformed row with unbalanced quotes will be silently truncated. Low risk for sandbox use.",
+    "Specs.jsx (frontend): row controls use spec-edit-{id}/spec-delete-{id} testids — good. New spec modal does NOT (visible in this run) carry [role='dialog'] — fine for users (visually correct), but recommend adding `role='dialog'` + `aria-labelledby` for a11y and easier Playwright targeting. The modal opens, fields render, Create button visible — verified via screenshot."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_user_specs.py"
+  ],
+  "success_rate": {
+    "backend": "98.5% (67/68 pytest); 100% (19/19) on new user-spec tests",
+    "frontend": "100% of tested phase A+B flows (Specs page render, sidebar nav, New-spec modal, Builder mandatory rings + missing-mandatory banner)"
+  },
+  "test_credentials": "admin@iso8583.dev / admin12345 — verified via /api/auth/login → 200, cookies propagate.",
+  "seed_data_creation": "test_user_specs.py creates 3 ephemeral specs (CRUD spec + CSV-import spec + JSON-import spec) all named TEST_*. TestUserSpecDelete::test_cleanup_csv_and_json_specs and test_delete_unregisters_spec tear them down. Net change to admin's user_specs: 0 rows after the suite.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "New regression file: /app/backend/tests/test_user_specs.py (19 tests). The /api/iso/preview response shape is {raw_hex, raw_base64, parsed:{mti, network_id, bitmap_hex, active_fields:[...], fields:[{field, name, value, encoding, length_type, wire_bytes}, ...]}, validation_errors:[]} — note 'fields' is a LIST of dicts, NOT a {field_num: value} dict. /api/logs returns {items, total} and each item's data elements live under parsed.fields[*]. Reserved network ids are visa/mastercard/amex/rupay (rejected by build_user_spec). User specs are scoped per user via the unique (user_id, network_id) index on db.user_specs. The /api/user-specs/template endpoint is purposely public (no Depends(get_current_user)). The Specs.jsx modal does not set role='dialog' so Playwright role-based selectors miss it — use data-testid selectors instead (specs-new-btn, specs-import-btn, spec-row-{id}). The Builder bitmap mandatory tile selector is `[data-mandatory=\"true\"]` and `[data-field=\"<n>\"]`.",
+  "rca of the issue": "N/A — no blocking issues. All Phase A (Builder spec hints, missing-mandatory banner, REQ badges, lint) and Phase B (user spec CRUD/import/CSV/JSON, /api/specs built-in+custom listing, hydration into NETWORK_SPECS, preview/send/validate honouring user specs, DELETE unregister) features verified end-to-end via 19/19 pytest assertions and Playwright UI smoke. The single suite-level failure (test_send_tcp_over_ws_roundtrip) is an upstream wss://iso8583-server.emergent.host sandbox flake carried over from iteration_3 — same diagnosis: external sandbox occasionally returns no 0810 response within timeout. Not a Phase A/B regression."
+}

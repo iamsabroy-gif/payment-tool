@@ -29,7 +29,11 @@ from iso8583 import (
     hex_to_base64,
     simulate_response,
     field_catalog,
+    mandatory_catalog,
     validate_message,
+    register_runtime_spec,
+    build_user_spec,
+    parse_spec_csv,
     RESPONSE_CODES,
 )
 from samples import SAMPLES
@@ -287,6 +291,34 @@ class BucketRunRequest(BaseModel):
     delay_ms: int = Field(default=0, ge=0, le=10_000)
 
 
+class UserSpecCreate(BaseModel):
+    """Lightweight payload — same shape `build_user_spec` accepts."""
+    model_config = ConfigDict(extra="ignore")
+    network_id: str
+    name: str
+    description: Optional[str] = None
+    mti_encoding: Optional[str] = "ascii"
+    bitmap_encoding: Optional[str] = "ascii_hex"
+    default_an_charset: Optional[str] = "ascii"
+    length_prefix_encoding: Optional[str] = "ascii"
+    fields: Dict[str, Dict] = Field(default_factory=dict)
+    mandatory_per_mti: Dict[str, List[int]] = Field(default_factory=dict)
+
+
+class UserSpecImport(BaseModel):
+    """Either a JSON spec or a CSV body (only one of `payload`/`csv_text`)."""
+    network_id: str
+    name: str
+    description: Optional[str] = None
+    mti_encoding: Optional[str] = "ascii"
+    bitmap_encoding: Optional[str] = "ascii_hex"
+    default_an_charset: Optional[str] = "ascii"
+    length_prefix_encoding: Optional[str] = "ascii"
+    csv_text: Optional[str] = None
+    payload: Optional[Dict] = None  # alternative to csv_text — full spec object
+    mandatory_per_mti: Dict[str, List[int]] = Field(default_factory=dict)
+
+
 # ---------------------------------------------------------------------------
 # Auth endpoints
 # ---------------------------------------------------------------------------
@@ -376,23 +408,212 @@ async def refresh(request: Request, response: Response):
 # Network specs & catalog
 # ---------------------------------------------------------------------------
 @api.get("/specs")
-async def list_specs():
-    return [
-        {"network_id": s["network_id"], "name": s["name"], "description": s["description"]}
-        for s in NETWORK_SPECS.values()
+async def list_specs(user=Depends(get_current_user)):
+    builtin = [
+        {"network_id": s["network_id"], "name": s["name"], "description": s.get("description", ""), "builtin": True}
+        for s in NETWORK_SPECS.values() if s.get("builtin")
     ]
+    custom_docs = await db.user_specs.find(
+        {"user_id": user["id"]}, {"_id": 0, "network_id": 1, "name": 1, "description": 1}
+    ).sort("name", 1).to_list(100)
+    custom = [{**d, "builtin": False} for d in custom_docs]
+    return builtin + custom
 
 
 @api.get("/specs/{network_id}/fields")
-async def get_spec_fields(network_id: str):
+async def get_spec_fields(network_id: str, user=Depends(get_current_user)):
+    await _ensure_user_spec_loaded(network_id, user)
     if network_id not in NETWORK_SPECS:
         raise HTTPException(status_code=404, detail="Network spec not found")
     return {"network_id": network_id, "fields": field_catalog(network_id)}
 
 
+@api.get("/specs/{network_id}/mandatory")
+async def get_spec_mandatory(network_id: str, user=Depends(get_current_user)):
+    """Return `{<mti>: [field, …]}` for the Builder spec-hint UI."""
+    await _ensure_user_spec_loaded(network_id, user)
+    if network_id not in NETWORK_SPECS:
+        raise HTTPException(status_code=404, detail="Network spec not found")
+    return {"network_id": network_id, "mandatory_per_mti": mandatory_catalog(network_id)}
+
+
+async def _ensure_user_spec_loaded(network_id: str, user: dict) -> None:
+    """If `network_id` is a custom spec id, hydrate it into the runtime registry."""
+    if not network_id or network_id in NETWORK_SPECS or not network_id.startswith("user:"):
+        return
+    doc = await db.user_specs.find_one(
+        {"network_id": network_id, "user_id": user["id"]}, {"_id": 0}
+    )
+    if not doc:
+        return
+    try:
+        register_runtime_spec(build_user_spec(doc))
+    except ValueError:
+        # Corrupt spec — leave registry untouched; downstream will 404.
+        return
+
+
 @api.get("/response-codes")
 async def response_codes():
     return RESPONSE_CODES
+
+
+# ---------------------------------------------------------------------------
+# User-defined specs (custom networks)
+# ---------------------------------------------------------------------------
+def _public_user_spec(doc: dict) -> dict:
+    """Strip private fields and the resolved `fields` dict (frontend reads
+    via `/specs/{nid}/fields` to get the catalog format)."""
+    return {
+        "id": doc.get("id"),
+        "network_id": doc.get("network_id"),
+        "name": doc.get("name"),
+        "description": doc.get("description") or "",
+        "mti_encoding": doc.get("mti_encoding"),
+        "bitmap_encoding": doc.get("bitmap_encoding"),
+        "default_an_charset": doc.get("default_an_charset"),
+        "length_prefix_encoding": doc.get("length_prefix_encoding"),
+        "fields": doc.get("fields") or {},
+        "mandatory_per_mti": doc.get("mandatory_per_mti") or {},
+        "created_at": doc.get("created_at"),
+        "updated_at": doc.get("updated_at"),
+    }
+
+
+@api.get("/user-specs")
+async def list_user_specs(user=Depends(get_current_user)):
+    docs = await db.user_specs.find(
+        {"user_id": user["id"]}, {"_id": 0}
+    ).sort("created_at", -1).to_list(100)
+    return [_public_user_spec(d) for d in docs]
+
+
+@api.get("/user-specs/template")
+async def user_spec_template_csv():
+    """Sample CSV the user can download, edit, and re-upload."""
+    sample = (
+        "field,name,format,length_type,max_length,encoding,length_encoding\n"
+        "2,Primary Account Number,n,LLVAR,19,ascii,ascii\n"
+        "3,Processing Code,n,fixed,6,ascii,ascii\n"
+        "4,Amount Transaction,n,fixed,12,ascii,ascii\n"
+        "7,Transmission Date Time,n,fixed,10,ascii,ascii\n"
+        "11,System Trace Audit Number,n,fixed,6,ascii,ascii\n"
+        "39,Response Code,an,fixed,2,ascii,ascii\n"
+        "41,Card Acceptor Terminal ID,ans,fixed,8,ascii,ascii\n"
+        "49,Currency Code,n,fixed,3,ascii,ascii\n"
+    )
+    return Response(
+        content=sample,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="iso8583-spec-template.csv"'},
+    )
+
+
+@api.post("/user-specs")
+async def create_user_spec(body: UserSpecCreate, user=Depends(get_current_user)):
+    try:
+        spec = build_user_spec(body.model_dump())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    existing = await db.user_specs.find_one(
+        {"user_id": user["id"], "network_id": spec["network_id"]}, {"_id": 1}
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Spec '{spec['network_id']}' already exists")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": user["id"],
+        "network_id": spec["network_id"],
+        "name": spec["name"],
+        "description": spec["description"],
+        "mti_encoding": spec["mti_encoding"],
+        "bitmap_encoding": spec["bitmap_encoding"],
+        "default_an_charset": spec["default_an_charset"],
+        "length_prefix_encoding": spec["length_prefix_encoding"],
+        # store overrides only — the resolved fields are rebuilt on hydrate.
+        "fields": body.fields or {},
+        "mandatory_per_mti": spec["mandatory_per_mti"],
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    await db.user_specs.insert_one(doc)
+    register_runtime_spec(spec)
+    return _public_user_spec(doc)
+
+
+@api.post("/user-specs/import")
+async def import_user_spec(body: UserSpecImport, user=Depends(get_current_user)):
+    """Build a spec from either a JSON `payload` or a `csv_text` body."""
+    if body.csv_text and body.payload:
+        raise HTTPException(status_code=400, detail="Provide either csv_text OR payload, not both")
+    if body.csv_text:
+        try:
+            fields = parse_spec_csv(body.csv_text)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"CSV parse error: {e}")
+        merge = {
+            "network_id": body.network_id,
+            "name": body.name,
+            "description": body.description,
+            "mti_encoding": body.mti_encoding,
+            "bitmap_encoding": body.bitmap_encoding,
+            "default_an_charset": body.default_an_charset,
+            "length_prefix_encoding": body.length_prefix_encoding,
+            "fields": fields,
+            "mandatory_per_mti": body.mandatory_per_mti,
+        }
+    elif body.payload:
+        # `payload` carries encodings + fields + mandatory; explicit network_id/name win.
+        merge = {
+            **body.payload,
+            "network_id": body.network_id,
+            "name": body.name,
+        }
+        if body.description is not None:
+            merge["description"] = body.description
+    else:
+        raise HTTPException(status_code=400, detail="Provide csv_text or payload")
+    create_body = UserSpecCreate(**merge)
+    return await create_user_spec(create_body, user)
+
+
+@api.put("/user-specs/{spec_id}")
+async def update_user_spec(spec_id: str, body: UserSpecCreate, user=Depends(get_current_user)):
+    existing = await db.user_specs.find_one({"id": spec_id, "user_id": user["id"]}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Spec not found")
+    try:
+        spec = build_user_spec(body.model_dump())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # disallow renaming the network_id under the user (would invalidate templates)
+    if spec["network_id"] != existing["network_id"]:
+        raise HTTPException(status_code=400, detail="network_id cannot change after create")
+    update = {
+        "name": spec["name"],
+        "description": spec["description"],
+        "mti_encoding": spec["mti_encoding"],
+        "bitmap_encoding": spec["bitmap_encoding"],
+        "default_an_charset": spec["default_an_charset"],
+        "length_prefix_encoding": spec["length_prefix_encoding"],
+        "fields": body.fields or {},
+        "mandatory_per_mti": spec["mandatory_per_mti"],
+        "updated_at": now_iso(),
+    }
+    await db.user_specs.update_one({"id": spec_id, "user_id": user["id"]}, {"$set": update})
+    register_runtime_spec(spec)
+    doc = await db.user_specs.find_one({"id": spec_id}, {"_id": 0})
+    return _public_user_spec(doc)
+
+
+@api.delete("/user-specs/{spec_id}")
+async def delete_user_spec(spec_id: str, user=Depends(get_current_user)):
+    doc = await db.user_specs.find_one({"id": spec_id, "user_id": user["id"]}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Spec not found")
+    await db.user_specs.delete_one({"id": spec_id, "user_id": user["id"]})
+    NETWORK_SPECS.pop(doc["network_id"], None)
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +679,7 @@ async def _execute_message(
     Returns ``{outbound, inbound, response_code, error}``.
     """
     await enforce_log_quota(user)
+    await _ensure_user_spec_loaded(network_id, user)
 
     # ---- Simulator branch -------------------------------------------------
     if not target or target == "simulator":
@@ -577,7 +799,8 @@ async def _execute_message(
 # ISO-8583 build / send / simulate
 # ---------------------------------------------------------------------------
 @api.post("/iso/preview")
-async def preview_message(body: SendTransactionRequest, _user=Depends(get_current_user)):
+async def preview_message(body: SendTransactionRequest, user=Depends(get_current_user)):
+    await _ensure_user_spec_loaded(body.network_id, user)
     errors = validate_message(body.mti, body.data_elements, body.network_id)
     try:
         raw_hex, meta = encode_message(body.mti, body.data_elements, body.network_id)
@@ -587,13 +810,15 @@ async def preview_message(body: SendTransactionRequest, _user=Depends(get_curren
 
 
 @api.post("/iso/validate")
-async def validate_only(body: SendTransactionRequest, _user=Depends(get_current_user)):
+async def validate_only(body: SendTransactionRequest, user=Depends(get_current_user)):
+    await _ensure_user_spec_loaded(body.network_id, user)
     return {"errors": validate_message(body.mti, body.data_elements, body.network_id)}
 
 
 @api.post("/iso/send")
 async def send_transaction(body: SendTransactionRequest, user=Depends(get_current_user)):
     await enforce_log_quota(user)
+    await _ensure_user_spec_loaded(body.network_id, user)
     try:
         req_hex, req_meta = encode_message(body.mti, body.data_elements, body.network_id)
     except ValueError as e:
@@ -933,6 +1158,7 @@ async def send_over_tcp_endpoint(body: TcpSendRequest, user=Depends(get_current_
     """Encode an ISO-8583 message and send it over the profile's transport
     (raw TCP or WebSocket). Request & response are both persisted as logs."""
     await enforce_log_quota(user)
+    await _ensure_user_spec_loaded(body.network_id, user)
 
     host = body.host
     port = body.port
@@ -1686,6 +1912,7 @@ async def on_startup():
     await db.payment_transactions.create_index("session_id", unique=True)
     await db.connection_profiles.create_index([("user_id", 1), ("created_at", -1)])
     await db.buckets.create_index([("user_id", 1), ("created_at", -1)])
+    await db.user_specs.create_index([("user_id", 1), ("network_id", 1)], unique=True)
     await db.transaction_logs.create_index([("user_id", 1), ("bucket_run_id", 1)])
     await db.login_attempts.create_index("identifier")
     await seed_admin()

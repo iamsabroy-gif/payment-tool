@@ -37,6 +37,7 @@ export default function Builder() {
     const [connStatuses, setConnStatuses] = useState({}); // {id: {state}}
     const [pinHelperOpen, setPinHelperOpen] = useState(false);
     const [keyToolsOpen, setKeyToolsOpen] = useState(false);
+    const [mandatoryByMti, setMandatoryByMti] = useState({}); // {0200: [2,3,4,...], ...}
 
     useEffect(() => {
         api.get("/specs").then((r) => setSpecs(r.data));
@@ -69,7 +70,16 @@ export default function Builder() {
 
     useEffect(() => {
         api.get(`/specs/${networkId}/fields`).then((r) => setFields(r.data.fields));
+        api.get(`/specs/${networkId}/mandatory`)
+            .then((r) => setMandatoryByMti(r.data.mandatory_per_mti || {}))
+            .catch(() => setMandatoryByMti({}));
     }, [networkId]);
+
+    // Currently-mandatory field set for the selected MTI
+    const mandatorySet = useMemo(() => new Set(mandatoryByMti?.[mti] || []), [mandatoryByMti, mti]);
+    const mandatoryMissing = useMemo(() => {
+        return [...mandatorySet].filter((f) => !active.has(f) || !String(values[f] || "").trim());
+    }, [mandatorySet, active, values]);
 
     // Preload template if ?template=id, or sample if ?sample=id
     useEffect(() => {
@@ -105,6 +115,28 @@ export default function Builder() {
         fields.forEach((f) => (m[f.field] = f));
         return m;
     }, [fields]);
+
+    /** Inline lint: returns null OR a string error for the given field's current value. */
+    const lintField = (fnum, raw) => {
+        const meta = fieldMap[fnum];
+        if (!meta) return null;
+        const v = String(raw ?? "");
+        if (!v) return null; // empty handled separately as missing-mandatory
+        const { format, length_type, max_length } = meta;
+        if (format === "n" && !/^\d+$/.test(v)) {
+            return "must be numeric";
+        }
+        if (format === "b" && !/^[0-9a-fA-F]*$/.test(v)) {
+            return "must be hex";
+        }
+        if (length_type === "fixed" && v.length > max_length) {
+            return `max ${max_length} chars`;
+        }
+        if ((length_type === "LLVAR" || length_type === "LLLVAR") && v.length > max_length) {
+            return `max ${max_length} chars`;
+        }
+        return null;
+    };
 
     const toggle = (f) => {
         setActive((prev) => {
@@ -214,18 +246,28 @@ export default function Builder() {
                     const isActive = active.has(f);
                     const hasValue = !!values[f];
                     const meta = fieldMap[f];
+                    const isMandatory = mandatorySet.has(f);
+                    const isMissingMandatory = isMandatory && (!isActive || !hasValue);
                     return (
                         <button
                             key={f}
                             type="button"
-                            title={meta?.name || `Field ${f}`}
+                            title={`${meta?.name || `Field ${f}`}${isMandatory ? " · mandatory for MTI " + mti : ""}`}
                             data-testid={`bitmap-tile-${f}`}
                             data-active={isActive}
                             data-has-value={hasValue}
+                            data-mandatory={isMandatory ? "true" : "false"}
+                            data-missing-mandatory={isMissingMandatory ? "true" : "false"}
                             onClick={() => toggle(f)}
-                            className="bitmap-tile"
+                            className={`bitmap-tile relative ${isMissingMandatory ? "ring-2 ring-[#E11D48] ring-inset" : ""}`}
                         >
                             <span className="text-[10px] leading-none">{f}</span>
+                            {isMandatory && (
+                                <span
+                                    className={`absolute top-0.5 right-0.5 w-1.5 h-1.5 rounded-full ${isActive && hasValue ? "bg-[#16A34A]" : "bg-[#E11D48]"}`}
+                                    aria-hidden="true"
+                                />
+                            )}
                         </button>
                     );
                 })}
@@ -271,9 +313,18 @@ export default function Builder() {
                         onChange={(e) => setNetworkId(e.target.value)}
                         className="mt-2 w-full h-9 border border-gray-300 px-2 text-sm font-mono bg-white"
                     >
-                        {specs.map((s) => (
-                            <option key={s.network_id} value={s.network_id}>{s.name}</option>
-                        ))}
+                        <optgroup label="Built-in">
+                            {specs.filter((s) => s.builtin !== false).map((s) => (
+                                <option key={s.network_id} value={s.network_id}>{s.name}</option>
+                            ))}
+                        </optgroup>
+                        {specs.some((s) => s.builtin === false) && (
+                            <optgroup label="Custom">
+                                {specs.filter((s) => s.builtin === false).map((s) => (
+                                    <option key={s.network_id} value={s.network_id}>{s.name}</option>
+                                ))}
+                            </optgroup>
+                        )}
                     </select>
                 </div>
                 <div className="bg-white p-4 col-span-12 md:col-span-2">
@@ -374,9 +425,17 @@ export default function Builder() {
 
             {/* Active data elements */}
             <section className="border border-[#E5E7EB]" data-testid="de-panel">
-                <div className="px-5 py-3 border-b border-[#E5E7EB] flex items-center justify-between">
+                <div className="px-5 py-3 border-b border-[#E5E7EB] flex items-center justify-between flex-wrap gap-2">
                     <div className="text-[11px] uppercase tracking-widest text-[#4B5563]">Active Data Elements</div>
-                    <span className="text-[11px] font-mono text-[#4B5563]">{activeSorted.length} fields</span>
+                    <div className="flex items-center gap-3 text-[11px] font-mono">
+                        {mandatoryMissing.length > 0 && (
+                            <span data-testid="builder-missing-mandatory" className="text-[#E11D48] flex items-center gap-1">
+                                <span className="w-1.5 h-1.5 rounded-full bg-[#E11D48] inline-block" />
+                                {mandatoryMissing.length} required field{mandatoryMissing.length === 1 ? "" : "s"} missing for {mti}
+                            </span>
+                        )}
+                        <span className="text-[#4B5563]">{activeSorted.length} fields</span>
+                    </div>
                 </div>
                 {activeSorted.length === 0 ? (
                     <div className="p-10 text-center text-sm text-[#4B5563]">Toggle bitmap tiles above to activate data elements.</div>
@@ -384,11 +443,25 @@ export default function Builder() {
                     <div className="divide-y divide-[#F3F4F6]">
                         {activeSorted.map((f) => {
                             const meta = fieldMap[f] || {};
+                            const isMandatory = mandatorySet.has(f);
+                            const lintErr = lintField(f, values[f]);
+                            const isEmpty = !String(values[f] || "").trim();
                             return (
-                                <div key={f} className="grid grid-cols-12 gap-3 px-5 py-3 items-center">
-                                    <div className="col-span-2 md:col-span-1 font-mono text-sm text-[#002FA7]">[{String(f).padStart(3, "0")}]</div>
+                                <div key={f} className="grid grid-cols-12 gap-3 px-5 py-3 items-start">
+                                    <div className="col-span-2 md:col-span-1 font-mono text-sm text-[#002FA7] pt-1.5">[{String(f).padStart(3, "0")}]</div>
                                     <div className="col-span-10 md:col-span-4">
-                                        <div className="text-sm">{meta.name || `Field ${f}`}</div>
+                                        <div className="text-sm flex items-center gap-2">
+                                            {meta.name || `Field ${f}`}
+                                            {isMandatory && (
+                                                <span
+                                                    data-testid={`de-mandatory-${f}`}
+                                                    className="text-[9px] uppercase tracking-widest border border-[#E11D48] text-[#E11D48] px-1 py-0.5"
+                                                    title={`Mandatory for MTI ${mti}`}
+                                                >
+                                                    REQ
+                                                </span>
+                                            )}
+                                        </div>
                                         <div className="text-[10px] uppercase tracking-widest text-[#9CA3AF]">
                                             {meta.format || "?"} · {meta.length_type || "?"} · max {meta.max_length || "?"}
                                         </div>
@@ -400,7 +473,11 @@ export default function Builder() {
                                                 value={values[f] || ""}
                                                 onChange={(e) => onValue(f, e.target.value)}
                                                 placeholder={meta.name}
-                                                className="flex-1 h-9 border border-gray-300 px-2 text-sm font-mono focus:border-[#002FA7]"
+                                                className={`flex-1 h-9 border px-2 text-sm font-mono focus:outline-none ${
+                                                    lintErr || (isMandatory && isEmpty)
+                                                        ? "border-[#E11D48] bg-[#FEF2F2] focus:border-[#E11D48]"
+                                                        : "border-gray-300 focus:border-[#002FA7]"
+                                                }`}
                                             />
                                             {f === 52 && (
                                                 <button
@@ -414,6 +491,11 @@ export default function Builder() {
                                                 </button>
                                             )}
                                         </div>
+                                        {(lintErr || (isMandatory && isEmpty)) && (
+                                            <div data-testid={`de-error-${f}`} className="text-[10px] text-[#E11D48] mt-1">
+                                                {lintErr || `Required for MTI ${mti}`}
+                                            </div>
+                                        )}
                                     </div>
                                 </div>
                             );
