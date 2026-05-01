@@ -11,6 +11,7 @@ import {
     Lightning,
     Plug,
     Stack,
+    Key,
 } from "@phosphor-icons/react";
 
 const NAV = [
@@ -19,6 +20,7 @@ const NAV = [
     { to: "/app/templates", label: "Templates", icon: BookBookmark, testid: "nav-templates" },
     { to: "/app/buckets", label: "Buckets", icon: Stack, testid: "nav-buckets" },
     { to: "/app/specs", label: "Specs", icon: BookOpen, testid: "nav-specs" },
+    { to: "/app/keys", label: "Key Vault", icon: Key, testid: "nav-keys" },
     { to: "/app/logs", label: "Logs", icon: ListDashes, testid: "nav-logs" },
     { to: "/app/connections", label: "Connections", icon: Plug, testid: "nav-connections" },
     { to: "/app/pricing", label: "Billing", icon: CreditCard, testid: "nav-pricing" },

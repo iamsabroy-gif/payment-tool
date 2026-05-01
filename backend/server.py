@@ -319,6 +319,24 @@ class UserSpecImport(BaseModel):
     mandatory_per_mti: Dict[str, List[int]] = Field(default_factory=dict)
 
 
+class KeySetIn(BaseModel):
+    """A named key set saved per user (e.g. 'VISA Production', 'MC Test').
+
+    Stores well-known EMV / VISA keys (MDK / CVK_A / CVK_B / PVK_A / PVK_B / PVKI),
+    plus an open-ended `extras` dict for additional keys (ZPK, TMK, ZMK, etc).
+    KCVs are recomputed on save and stored alongside each key for the UI.
+    """
+    name: str
+    description: Optional[str] = None
+    mdk_hex: Optional[str] = None
+    cvk_a_hex: Optional[str] = None
+    cvk_b_hex: Optional[str] = None
+    pvk_a_hex: Optional[str] = None
+    pvk_b_hex: Optional[str] = None
+    pvki: Optional[str] = None        # 1-digit PVV Key Indicator
+    extras: Dict[str, str] = Field(default_factory=dict)  # {alias_upper: hex}
+
+
 # ---------------------------------------------------------------------------
 # Auth endpoints
 # ---------------------------------------------------------------------------
@@ -1022,6 +1040,133 @@ async def keys_arpc(body: ArpcRequest, _user=Depends(get_current_user)):
         # F55 sub-element 91 = Issuer Authentication Data = ARPC || ARC (10 bytes total)
         "f55_tlv_hex": f"910A{arpc}{body.arc_hex.upper().ljust(4, '0')}",
     }
+
+
+# ---------------------------------------------------------------------------
+# User key vault (saved keys + auto-KCV)
+# ---------------------------------------------------------------------------
+def _safe_kcv(key_hex: Optional[str], algorithm: str = "3DES") -> Optional[str]:
+    """Compute KCV but return None for empty / malformed values (UI tolerates it)."""
+    if not key_hex:
+        return None
+    try:
+        return compute_kcv(key_hex, algorithm)
+    except ValueError:
+        return None
+
+
+def _decorate_keyset(doc: dict) -> dict:
+    """Attach a `kcv` map computed from the stored hex values."""
+    out = {**doc}
+    out.pop("_id", None)
+    cvk_combined = (out.get("cvk_a_hex") or "") + (out.get("cvk_b_hex") or "")
+    pvk_combined = (out.get("pvk_a_hex") or "") + (out.get("pvk_b_hex") or "")
+    kcv: Dict[str, Optional[str]] = {
+        "MDK": _safe_kcv(out.get("mdk_hex"), "3DES"),
+        "CVK_A": _safe_kcv(out.get("cvk_a_hex"), "3DES"),
+        "CVK_B": _safe_kcv(out.get("cvk_b_hex"), "3DES"),
+        "CVK": _safe_kcv(cvk_combined, "3DES") if cvk_combined and len(cvk_combined) >= 16 else None,
+        "PVK_A": _safe_kcv(out.get("pvk_a_hex"), "3DES"),
+        "PVK_B": _safe_kcv(out.get("pvk_b_hex"), "3DES"),
+        "PVK": _safe_kcv(pvk_combined, "3DES") if pvk_combined and len(pvk_combined) >= 16 else None,
+    }
+    extras_kcv: Dict[str, Optional[str]] = {}
+    for alias, hex_val in (out.get("extras") or {}).items():
+        extras_kcv[alias] = _safe_kcv(hex_val, "3DES")
+    out["kcv"] = {k: v for k, v in kcv.items() if v is not None}
+    out["extras_kcv"] = {k: v for k, v in extras_kcv.items() if v is not None}
+    return out
+
+
+def _normalise_hex(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return ""
+    cleaned = value.replace(" ", "").replace("-", "").upper()
+    # validate hex characters but allow empty placeholder
+    if cleaned and not all(c in "0123456789ABCDEF" for c in cleaned):
+        raise HTTPException(status_code=400, detail=f"Key contains non-hex characters: {value!r}")
+    if cleaned and len(cleaned) % 2 != 0:
+        raise HTTPException(status_code=400, detail="Key hex length must be even")
+    return cleaned
+
+
+@api.get("/user-keys")
+async def list_user_keys(user=Depends(get_current_user)):
+    docs = await db.user_keys.find(
+        {"user_id": user["id"]}, {"_id": 0}
+    ).sort("created_at", -1).to_list(100)
+    return [_decorate_keyset(d) for d in docs]
+
+
+@api.post("/user-keys")
+async def create_user_keys(body: KeySetIn, user=Depends(get_current_user)):
+    if not body.name.strip():
+        raise HTTPException(status_code=400, detail="name is required")
+    pvki = (body.pvki or "").strip()
+    if pvki and not (len(pvki) == 1 and pvki.isdigit()):
+        raise HTTPException(status_code=400, detail="PVKI must be a single digit (0–9)")
+    extras = {}
+    for alias, hex_val in (body.extras or {}).items():
+        alias_norm = (alias or "").strip().upper()
+        if not alias_norm:
+            continue
+        extras[alias_norm] = _normalise_hex(hex_val) or ""
+    doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": user["id"],
+        "name": body.name.strip(),
+        "description": (body.description or "").strip(),
+        "mdk_hex": _normalise_hex(body.mdk_hex),
+        "cvk_a_hex": _normalise_hex(body.cvk_a_hex),
+        "cvk_b_hex": _normalise_hex(body.cvk_b_hex),
+        "pvk_a_hex": _normalise_hex(body.pvk_a_hex),
+        "pvk_b_hex": _normalise_hex(body.pvk_b_hex),
+        "pvki": pvki,
+        "extras": extras,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    await db.user_keys.insert_one(doc)
+    return _decorate_keyset(doc)
+
+
+@api.put("/user-keys/{keyset_id}")
+async def update_user_keys(keyset_id: str, body: KeySetIn, user=Depends(get_current_user)):
+    existing = await db.user_keys.find_one({"id": keyset_id, "user_id": user["id"]}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Key set not found")
+    pvki = (body.pvki or "").strip()
+    if pvki and not (len(pvki) == 1 and pvki.isdigit()):
+        raise HTTPException(status_code=400, detail="PVKI must be a single digit (0–9)")
+    extras = {}
+    for alias, hex_val in (body.extras or {}).items():
+        alias_norm = (alias or "").strip().upper()
+        if not alias_norm:
+            continue
+        extras[alias_norm] = _normalise_hex(hex_val) or ""
+    update = {
+        "name": body.name.strip() or existing["name"],
+        "description": (body.description or "").strip(),
+        "mdk_hex": _normalise_hex(body.mdk_hex),
+        "cvk_a_hex": _normalise_hex(body.cvk_a_hex),
+        "cvk_b_hex": _normalise_hex(body.cvk_b_hex),
+        "pvk_a_hex": _normalise_hex(body.pvk_a_hex),
+        "pvk_b_hex": _normalise_hex(body.pvk_b_hex),
+        "pvki": pvki,
+        "extras": extras,
+        "updated_at": now_iso(),
+    }
+    await db.user_keys.update_one({"id": keyset_id, "user_id": user["id"]}, {"$set": update})
+    doc = await db.user_keys.find_one({"id": keyset_id}, {"_id": 0})
+    return _decorate_keyset(doc)
+
+
+@api.delete("/user-keys/{keyset_id}")
+async def delete_user_keys(keyset_id: str, user=Depends(get_current_user)):
+    res = await db.user_keys.delete_one({"id": keyset_id, "user_id": user["id"]})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Key set not found")
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1916,6 +2061,7 @@ async def on_startup():
     await db.connection_profiles.create_index([("user_id", 1), ("created_at", -1)])
     await db.buckets.create_index([("user_id", 1), ("created_at", -1)])
     await db.user_specs.create_index([("user_id", 1), ("network_id", 1)], unique=True)
+    await db.user_keys.create_index([("user_id", 1), ("created_at", -1)])
     await db.transaction_logs.create_index([("user_id", 1), ("bucket_run_id", 1)])
     await db.login_attempts.create_index("identifier")
     await seed_admin()

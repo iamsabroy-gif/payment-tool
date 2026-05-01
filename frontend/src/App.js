@@ -16,6 +16,7 @@ import CheckoutReturn from "./pages/CheckoutReturn";
 import Connections from "./pages/Connections";
 import Buckets from "./pages/Buckets";
 import Specs from "./pages/Specs";
+import KeyVault from "./pages/KeyVault";
 
 function PublicOnly({ children }) {
     const { user, loading } = useAuth();
@@ -48,6 +49,7 @@ function App() {
                             <Route path="templates" element={<Templates />} />
                             <Route path="buckets" element={<Buckets />} />
                             <Route path="specs" element={<Specs />} />
+                            <Route path="keys" element={<KeyVault />} />
                             <Route path="logs" element={<Logs />} />
                             <Route path="connections" element={<Connections />} />
                             <Route path="pricing" element={<Pricing />} />
