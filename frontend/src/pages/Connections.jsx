@@ -22,15 +22,30 @@ const LENGTH_HEADERS = [
     { value: "none", label: "None (raw stream)", help: "Server closes socket to end message" },
 ];
 
+const TRANSPORTS = [
+    { value: "tcp", label: "Raw TCP", help: "Direct socket to a CBS / switch host." },
+    { value: "websocket", label: "WebSocket (wss)", help: "Hosted simulator behind ingress (e.g. wss://iso8583-server.emergent.host/api/ws/iso8583)." },
+];
+
+const WIRE_FORMATS = [
+    { value: "native", label: "Native (binary bitmap, BCD/EBCDIC)", help: "VISA/Mastercard/AMEX wire fidelity." },
+    { value: "ascii", label: "ASCII (debug-friendly)", help: "Hex-bitmap, ASCII fields. Easier to eyeball." },
+];
+
 const EMPTY = {
     name: "",
+    transport: "tcp",
     host: "",
     port: 8583,
+    ws_url: "",
+    auth_token: "",
+    ws_text_mode: false,
     length_header: "2_byte",
     use_tls: false,
     timeout_sec: 10,
     auto_heartbeat: false,
     heartbeat_interval_sec: 30,
+    wire_format: "native",
     description: "",
 };
 
@@ -84,11 +99,22 @@ export default function Connections() {
         e.preventDefault();
         setSaving(true);
         try {
+            const isWs = form.transport === "websocket";
             const payload = {
-                ...form,
-                port: Number(form.port),
+                name: form.name,
+                transport: form.transport,
+                host: isWs ? "" : form.host,
+                port: isWs ? null : Number(form.port),
+                ws_url: isWs ? form.ws_url : "",
+                auth_token: isWs ? form.auth_token : "",
+                ws_text_mode: isWs ? form.ws_text_mode : false,
+                length_header: form.length_header,
+                use_tls: form.use_tls,
                 timeout_sec: Number(form.timeout_sec),
+                auto_heartbeat: form.auto_heartbeat,
                 heartbeat_interval_sec: Number(form.heartbeat_interval_sec),
+                wire_format: form.wire_format,
+                description: form.description,
             };
             if (editing === "new") {
                 const { data } = await api.post("/connections", payload);
@@ -123,7 +149,8 @@ export default function Connections() {
         try {
             const { data } = await api.post(`/connections/${c.id}/connect`);
             setStatusMap((prev) => ({ ...prev, [c.id]: data }));
-            toast.success(`Connected to ${c.host}:${c.port}`);
+            const target = c.transport === "websocket" ? c.ws_url : `${c.host}:${c.port}`;
+            toast.success(`Connected to ${target}`);
         } catch (e) {
             toast.error(apiErr(e));
         } finally {
@@ -195,8 +222,11 @@ export default function Connections() {
                                         </div>
                                     </div>
                                 </div>
-                                <div className="col-span-6 md:col-span-3 font-mono text-xs text-[#111827]">{c.host}:{c.port}</div>
+                                <div className="col-span-6 md:col-span-3 font-mono text-xs text-[#111827] break-all">
+                                    {c.transport === "websocket" ? (c.ws_url || "—") : `${c.host}:${c.port}`}
+                                </div>
                                 <div className="col-span-6 md:col-span-2 text-[10px] uppercase tracking-widest text-[#4B5563] flex flex-wrap gap-1">
+                                    <span className="border border-gray-300 px-1.5 py-0.5">{c.transport === "websocket" ? "wss" : "tcp"}</span>
                                     <span className="border border-gray-300 px-1.5 py-0.5">{c.length_header}</span>
                                     {c.auto_heartbeat && <span className="border border-[#16A34A] text-[#16A34A] px-1.5 py-0.5 flex items-center gap-1"><Heartbeat size={10} weight="fill" /> {c.heartbeat_interval_sec}s</span>}
                                 </div>
@@ -253,16 +283,97 @@ export default function Connections() {
                             <Field label="Name">
                                 <input data-testid="connection-name-input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required className="w-full h-9 border border-gray-300 px-2 text-sm focus:border-[#002FA7]" />
                             </Field>
-                            <div className="grid grid-cols-3 gap-3">
-                                <div className="col-span-2">
-                                    <Field label="Host (IP or DNS)">
-                                        <input data-testid="connection-host-input" value={form.host} onChange={(e) => setForm({ ...form, host: e.target.value })} placeholder="10.0.12.5" required className="w-full h-9 border border-gray-300 px-2 text-sm font-mono focus:border-[#002FA7]" />
-                                    </Field>
+
+                            <Field label="Transport">
+                                <div className="grid grid-cols-1 gap-1">
+                                    {TRANSPORTS.map((t) => (
+                                        <label key={t.value} className={`border px-3 py-2 cursor-pointer flex items-center gap-3 transition-colors ${form.transport === t.value ? "border-[#002FA7] bg-[#F3F4F6]" : "border-gray-300 hover:bg-gray-50"}`}>
+                                            <input type="radio" name="transport" value={t.value} checked={form.transport === t.value} onChange={() => setForm({ ...form, transport: t.value })} data-testid={`connection-transport-${t.value}`} />
+                                            <div>
+                                                <div className="text-sm">{t.label}</div>
+                                                <div className="text-[11px] text-[#4B5563]">{t.help}</div>
+                                            </div>
+                                        </label>
+                                    ))}
                                 </div>
-                                <Field label="Port">
-                                    <input data-testid="connection-port-input" type="number" min={1} max={65535} value={form.port} onChange={(e) => setForm({ ...form, port: e.target.value })} required className="w-full h-9 border border-gray-300 px-2 text-sm font-mono focus:border-[#002FA7]" />
-                                </Field>
-                            </div>
+                            </Field>
+
+                            {form.transport === "tcp" ? (
+                                <>
+                                    <div className="grid grid-cols-3 gap-3">
+                                        <div className="col-span-2">
+                                            <Field label="Host (IP or DNS)">
+                                                <input data-testid="connection-host-input" value={form.host} onChange={(e) => setForm({ ...form, host: e.target.value })} placeholder="10.0.12.5" required className="w-full h-9 border border-gray-300 px-2 text-sm font-mono focus:border-[#002FA7]" />
+                                            </Field>
+                                        </div>
+                                        <Field label="Port">
+                                            <input data-testid="connection-port-input" type="number" min={1} max={65535} value={form.port} onChange={(e) => setForm({ ...form, port: e.target.value })} required className="w-full h-9 border border-gray-300 px-2 text-sm font-mono focus:border-[#002FA7]" />
+                                        </Field>
+                                    </div>
+                                    <label className="flex flex-col">
+                                        <span className="text-[10px] uppercase tracking-widest text-[#4B5563]">TLS</span>
+                                        <div className="mt-1 flex items-center gap-2 h-9 border border-gray-300 px-3">
+                                            <input data-testid="connection-tls-checkbox" type="checkbox" checked={form.use_tls} onChange={(e) => setForm({ ...form, use_tls: e.target.checked })} />
+                                            <span className="text-sm">{form.use_tls ? "Encrypted (TLS)" : "Plain TCP"}</span>
+                                        </div>
+                                    </label>
+                                </>
+                            ) : (
+                                <>
+                                    <Field label="WebSocket URL">
+                                        <input
+                                            data-testid="connection-wsurl-input"
+                                            value={form.ws_url}
+                                            onChange={(e) => setForm({ ...form, ws_url: e.target.value })}
+                                            placeholder="wss://iso8583-server.emergent.host/api/ws/iso8583"
+                                            required
+                                            className="w-full h-9 border border-gray-300 px-2 text-sm font-mono focus:border-[#002FA7]"
+                                        />
+                                    </Field>
+                                    <Field label="JWT Token (appended as ?token=…)">
+                                        <textarea
+                                            data-testid="connection-token-input"
+                                            value={form.auth_token}
+                                            onChange={(e) => setForm({ ...form, auth_token: e.target.value })}
+                                            placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9…"
+                                            rows={3}
+                                            className="w-full border border-gray-300 px-2 py-1.5 text-[11px] font-mono focus:border-[#002FA7] break-all resize-y"
+                                        />
+                                        <div className="text-[10px] text-[#4B5563] mt-1">
+                                            Paste the bearer JWT issued by the upstream server. We never log it.
+                                        </div>
+                                    </Field>
+                                    <label className="flex items-start gap-3 cursor-pointer border border-[#E5E7EB] p-3">
+                                        <input
+                                            data-testid="connection-wstext-checkbox"
+                                            type="checkbox"
+                                            checked={form.ws_text_mode}
+                                            onChange={(e) => setForm({ ...form, ws_text_mode: e.target.checked })}
+                                            className="mt-0.5"
+                                        />
+                                        <div className="flex-1">
+                                            <div className="text-sm font-medium">Send hex-text WS frames</div>
+                                            <div className="text-[11px] text-[#4B5563] mt-0.5">
+                                                Some hosted simulators expect TEXT frames carrying hex; default is BINARY frames.
+                                            </div>
+                                        </div>
+                                    </label>
+                                </>
+                            )}
+
+                            <Field label="Wire format">
+                                <div className="grid grid-cols-1 gap-1">
+                                    {WIRE_FORMATS.map((w) => (
+                                        <label key={w.value} className={`border px-3 py-2 cursor-pointer flex items-center gap-3 transition-colors ${form.wire_format === w.value ? "border-[#002FA7] bg-[#F3F4F6]" : "border-gray-300 hover:bg-gray-50"}`}>
+                                            <input type="radio" name="wire_format" value={w.value} checked={form.wire_format === w.value} onChange={() => setForm({ ...form, wire_format: w.value })} data-testid={`connection-wire-${w.value}`} />
+                                            <div>
+                                                <div className="text-sm">{w.label}</div>
+                                                <div className="text-[11px] text-[#4B5563]">{w.help}</div>
+                                            </div>
+                                        </label>
+                                    ))}
+                                </div>
+                            </Field>
 
                             <Field label="Length header framing">
                                 <div className="grid grid-cols-1 gap-1">
@@ -278,18 +389,9 @@ export default function Connections() {
                                 </div>
                             </Field>
 
-                            <div className="grid grid-cols-2 gap-3">
-                                <Field label="Timeout (sec)">
-                                    <input data-testid="connection-timeout-input" type="number" min={1} max={120} value={form.timeout_sec} onChange={(e) => setForm({ ...form, timeout_sec: e.target.value })} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
-                                </Field>
-                                <label className="flex flex-col">
-                                    <span className="text-[10px] uppercase tracking-widest text-[#4B5563]">TLS</span>
-                                    <div className="mt-1 flex items-center gap-2 h-9 border border-gray-300 px-3">
-                                        <input data-testid="connection-tls-checkbox" type="checkbox" checked={form.use_tls} onChange={(e) => setForm({ ...form, use_tls: e.target.checked })} />
-                                        <span className="text-sm">{form.use_tls ? "Encrypted (TLS)" : "Plain TCP"}</span>
-                                    </div>
-                                </label>
-                            </div>
+                            <Field label="Timeout (sec)">
+                                <input data-testid="connection-timeout-input" type="number" min={1} max={120} value={form.timeout_sec} onChange={(e) => setForm({ ...form, timeout_sec: e.target.value })} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
+                            </Field>
 
                             <div className="border border-[#E5E7EB] p-3 bg-[#F9FAFB]">
                                 <label className="flex items-start gap-3 cursor-pointer">

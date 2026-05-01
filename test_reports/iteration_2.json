@@ -1,0 +1,44 @@
+{
+  "summary": "Regression run after WebSocket transport + full-fidelity codecs + PIN/key crypto + samples + connection-profile transport switch. Backend pytest 34/34 PASSED (16 original API + 4 codec + 14 new-feature tests including live wss://iso8583-server.emergent.host round-trip 0800->0810 RC=00, crypto routes kcv/cvv/pvv/arqc/pin-encrypt, WS profile CRUD echoes auth_token but never auth_password, samples listing). Frontend Playwright: admin login + logout work, /app/connections New-profile modal exposes the WebSocket transport selector and all WS-only fields (ws_url, JWT textarea, ws_text_mode checkbox, wire_format radio, length_header radio), saving creates profile visible in list with the wss URL + 'wss' badge, Connect transitions the row to the connected state (Disconnect button replaces Connect), Disconnect reverses it, Delete tears it down. Builder, Logs, Templates, Pricing, Dashboard all render without critical console errors. ASCII secondary-bitmap decode regression covered by test_iso8583_codecs.py::test_ascii_decode_with_secondary_bitmap and passes.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "GET /api/billing/status/{id}", "issue": "Still returns 502 immediately after checkout session creation with sk_test_emergent (noted in iteration_1). billing_test tolerates 200|502 so suite stays green; fix remains pending."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Some <select> control (admin area)", "issues": ["React hydration warning: 'In HTML, <span> cannot be a child of <option>'. A <select><option> node is wrapping children in a <span>. Non-functional but noisy — find the <option> that renders a <span> inside it and replace with a plain text node or use an aria-label."]},
+      {"screen": "Dashboard (recharts)", "issues": ["Iteration_1 width(-1)/height(-1) warning not re-checked; low priority."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/test_iso8583_codecs.py",
+    "/app/backend/tests/test_new_features.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Track down the <option> with a <span> child to silence the React hydration warning — grep src/pages for '<option' that contains JSX children beyond plain strings (most likely Builder.jsx network select or Logs.jsx filter dropdowns).",
+    "(Carry-over) Handle 502 from /api/billing/status/{id} gracefully in the /billing/return polling page or treat as pending."
+  ],
+  "critical_code_review_comments": [
+    "server.py create_connection (line 663-672) validates length_header twice — harmless duplication, remove one check.",
+    "server.py connect_endpoint (line 755-758) still reports 'Timeout contacting {host}:{port}' even for websocket profiles where host/port are empty — for WS transport, use profile['ws_url'] in the error message so users see the actual failing URL.",
+    "session_manager.send_on_session is invoked from /api/iso/send-tcp even for WS transport — name is misleading; consider renaming to send_on_active_session for clarity (functional behavior is correct).",
+    "ConnectionProfileIn.update_connection (line 703) does not re-validate transport-specific required fields (ws_url for websocket, host+port for tcp) — possible to edit a ws profile and blank ws_url.",
+    "@app.on_event('startup'/'shutdown') deprecated — migrate to FastAPI lifespan."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_new_features.py"
+  ],
+  "success_rate": {"backend": "100% (34/34 pytest)", "frontend": "100% of tested flows"},
+  "test_credentials": "admin@iso8583.dev / admin12345 works. Live WS JWT for wss://iso8583-server.emergent.host/api/ws/iso8583 works end-to-end from this preview pod (0800->0810 RC=00).",
+  "seed_data_creation": "Each test_new_features.py run creates a TEST_ws_<uuid> connection profile on the admin account and deletes it on teardown. TestLiveWebSocketRoundTrip reuses the same profile for connect/send/disconnect. A new TEST_ui_ws_<ts> profile is also created and deleted via the Playwright UI flow. No leftover data expected.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Test files at /app/backend/tests/backend_test.py, test_iso8583_codecs.py, and new test_new_features.py are reusable. Live WS upstream wss://iso8583-server.emergent.host/api/ws/iso8583 is reachable from this pod; JWT token hardcoded in test_new_features.py LIVE_WS_TOKEN constant expires 2026-05-02 (exp 1777749799). If tests start failing with 502/504 on the live round-trip and the token hasn't expired, the upstream may be offline — tests are written to SKIP (not fail) in that case. Iteration_1 quota test (51 logs on fresh free user) still runs in backend_test.py::TestFreeQuota — it creates a one-off TEST_ user; safe to re-run but accumulates ~100 logs per run.",
+  "rca of the issue": "N/A — no blocking issues found in this iteration. Only pre-existing billing/status 502 carried forward from iteration_1, tolerated by the test suite."
+}

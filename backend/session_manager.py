@@ -145,6 +145,7 @@ async def connect_session(profile: dict) -> Session:
     elif transport == "websocket":
         ws, _token = await open_ws_connection(
             ws_url=profile["ws_url"],
+            token=(profile.get("auth_token") or None),
             auth_login_url=profile.get("auth_login_url") or None,
             username=profile.get("auth_username") or None,
             password=profile.get("auth_password") or None,

@@ -464,18 +464,20 @@ def decode_message(raw_hex: str, network_id: str = "visa", wire_format: str = "n
         bitmap_hex = data[pos:pos + consumed].hex().upper()
         pos += consumed
     else:
-        # ASCII hex
+        # ASCII hex — peek primary first, then maybe read secondary,
+        # then run the binary decoder over the combined bytes.
         primary_hex = data[pos:pos + 16].decode("ascii", errors="replace")
         pos += 16
-        active_fields, _ = binary_bitmap_decode(bytes.fromhex(primary_hex), 0)
+        primary_bytes = bytes.fromhex(primary_hex)
+        has_secondary = bool(primary_bytes[0] & 0x80)
         bitmap_hex = primary_hex
-        if 1 in active_fields:
+        combined = primary_bytes
+        if has_secondary:
             secondary_hex = data[pos:pos + 16].decode("ascii", errors="replace")
             pos += 16
-            extra, _ = binary_bitmap_decode(bytes.fromhex(secondary_hex), 0)
-            active_fields = [f for f in active_fields if f != 1] + [64 + g for g in extra]
-            active_fields.sort()
+            combined = primary_bytes + bytes.fromhex(secondary_hex)
             bitmap_hex += secondary_hex
+        active_fields, _ = binary_bitmap_decode(combined, 0)
 
     parsed_fields: List[Dict] = []
     for f in active_fields:

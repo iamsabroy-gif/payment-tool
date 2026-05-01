@@ -203,6 +203,7 @@ class ConnectionProfileIn(BaseModel):
     auth_login_url: Optional[str] = None
     auth_username: Optional[str] = None
     auth_password: Optional[str] = None
+    auth_token: Optional[str] = None   # paste a pre-issued JWT directly (preferred)
     ws_text_mode: bool = False         # send hex text frames instead of binary
     # shared
     length_header: str = Field(default="2_byte")
@@ -680,6 +681,7 @@ async def create_connection(body: ConnectionProfileIn, user=Depends(get_current_
         "auth_login_url": (body.auth_login_url or "").strip(),
         "auth_username": (body.auth_username or "").strip(),
         "auth_password": body.auth_password or "",
+        "auth_token": (body.auth_token or "").strip(),
         "ws_text_mode": body.ws_text_mode,
         "length_header": body.length_header,
         "use_tls": body.use_tls,
@@ -721,6 +723,8 @@ async def update_connection(conn_id: str, body: ConnectionProfileIn, user=Depend
     }
     if body.auth_password:
         update["auth_password"] = body.auth_password
+    if body.auth_token is not None:
+        update["auth_token"] = body.auth_token.strip()
     res = await db.connection_profiles.update_one(
         {"id": conn_id, "user_id": user["id"]}, {"$set": update}
     )
