@@ -190,7 +190,7 @@ async def disconnect_session(profile_id: str) -> bool:
     return True
 
 
-async def send_on_session(profile_id: str, body: bytes) -> Tuple[bytes, bytes]:
+async def send_on_session(profile_id: str, body: bytes, *, from_heartbeat: bool = False) -> Tuple[bytes, bytes]:
     sess = _sessions.get(profile_id)
     if not sess or not sess.is_open():
         raise ConnectionError("Session is not connected")
@@ -212,7 +212,16 @@ async def send_on_session(profile_id: str, body: bytes) -> Tuple[bytes, bytes]:
                 )
         except Exception as e:
             sess.last_error = str(e)
-            asyncio.create_task(_mark_dead(profile_id, str(e)))
+            # Only tear down if this wasn't a heartbeat probe (heartbeats are best-effort).
+            # Real send failures or transport-broken errors still mark the session dead so
+            # the client gets a fresh handshake on the next attempt.
+            transport_dead = isinstance(e, (ConnectionError, OSError)) or (
+                sess.transport == "websocket" and getattr(sess.ws, "closed", False)
+            ) or (
+                sess.transport == "tcp" and sess.writer and sess.writer.is_closing()
+            )
+            if not from_heartbeat or transport_dead:
+                asyncio.create_task(_mark_dead(profile_id, str(e)))
             raise
         sess.last_activity_at = _now()
         sess.last_error = None
@@ -230,6 +239,8 @@ async def _heartbeat_loop(profile_id: str):
         return
     interval = sess.heartbeat_interval_sec
     logger.info("[heartbeat] starting for %s every %ss", profile_id, interval)
+    consecutive_failures = 0
+    MAX_FAILURES = 3
     try:
         while True:
             await asyncio.sleep(interval)
@@ -244,7 +255,7 @@ async def _heartbeat_loop(profile_id: str):
                     "70": "301",
                 }
                 req_hex, _ = encode_message("0800", de, "visa", wire_format=sess.wire_format)
-                _, resp = await send_on_session(profile_id, bytes.fromhex(req_hex))
+                _, resp = await send_on_session(profile_id, bytes.fromhex(req_hex), from_heartbeat=True)
                 rc = "00"
                 try:
                     ascii_resp = resp.decode("latin-1", errors="replace")
@@ -255,12 +266,23 @@ async def _heartbeat_loop(profile_id: str):
                     pass
                 sess.last_heartbeat_at = _now()
                 sess.last_heartbeat_rc = rc
+                consecutive_failures = 0
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning("[heartbeat] %s failed: %s", profile_id, e)
+                consecutive_failures += 1
+                logger.warning(
+                    "[heartbeat] %s failed (%d/%d): %s",
+                    profile_id, consecutive_failures, MAX_FAILURES, e,
+                )
                 if sess:
-                    sess.last_error = f"heartbeat: {e}"
-                return
+                    sess.last_error = f"heartbeat: {e} ({consecutive_failures}/{MAX_FAILURES})"
+                # Three strikes — tear the session down so the next call re-opens fresh.
+                if consecutive_failures >= MAX_FAILURES:
+                    logger.warning("[heartbeat] %s exceeded %d failures; marking dead", profile_id, MAX_FAILURES)
+                    asyncio.create_task(_mark_dead(profile_id, f"heartbeat: {MAX_FAILURES} consecutive failures"))
+                    return
+                # Otherwise keep the session alive — many issuer simulators reject
+                # 0800 echoes but happily handle 0200 traffic.
     except asyncio.CancelledError:
         logger.info("[heartbeat] cancelled for %s", profile_id)

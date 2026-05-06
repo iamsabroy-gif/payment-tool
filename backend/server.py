@@ -1301,6 +1301,92 @@ async def connection_status(conn_id: str, user=Depends(get_current_user)):
     return await session_status(conn_id)
 
 
+@api.post("/connections/{conn_id}/test")
+async def connection_test(conn_id: str, user=Depends(get_current_user)):
+    """Send a single 0800 echo to confirm the configured framing actually
+    round-trips. Auto-opens the session if it isn't connected. Returns the
+    decoded response code + raw hex on both sides for easy diagnosis."""
+    profile = await db.connection_profiles.find_one({"id": conn_id, "user_id": user["id"]}, {"_id": 0})
+    if not profile:
+        raise HTTPException(status_code=404, detail="Connection profile not found")
+
+    # Open the session if it isn't already.
+    auto_opened = False
+    if not session_is_connected(conn_id):
+        try:
+            await connect_session(profile)
+            auto_opened = True
+        except Exception as e:
+            return {
+                "ok": False,
+                "stage": "connect",
+                "error": str(e),
+                "hint": "Failed to open the WebSocket / TCP handshake. Verify the URL, JWT and that the host is reachable.",
+            }
+
+    wire_format = profile.get("wire_format", "native")
+    transport = profile.get("transport", "tcp")
+    text_mode = bool(profile.get("ws_text_mode")) if transport == "websocket" else None
+    length_header = profile.get("length_header", "2_byte")
+
+    de = {
+        "7": datetime.now(timezone.utc).strftime("%m%d%H%M%S"),
+        "11": "999001",
+        "70": "301",
+    }
+    try:
+        req_hex, _ = encode_message("0800", de, "visa", wire_format=wire_format)
+    except ValueError as e:
+        return {"ok": False, "stage": "encode", "error": str(e)}
+
+    try:
+        framed, response_bytes = await send_on_session(conn_id, bytes.fromhex(req_hex))
+    except Exception as e:
+        # Build a hint based on common misconfiguration symptoms.
+        hint = None
+        msg = str(e).lower()
+        if "timeout" in msg or "timed out" in msg:
+            hint = (
+                "No response within timeout. The most common cause for "
+                "wss://iso8583-server.emergent.host is wire_format=native + ws_text_mode=off — "
+                "that server expects ASCII payload + 2-byte length + WS hex-text frames."
+            )
+        elif "invalid hex" in msg:
+            hint = "Server rejected the frame as 'invalid hex'. Toggle 'Send hex-text WS frames' OFF or set wire_format=ascii."
+        return {
+            "ok": False, "stage": "send",
+            "framing": {"wire_format": wire_format, "length_header": length_header, "ws_text_mode": text_mode},
+            "request_hex": req_hex,
+            "error": str(e),
+            "hint": hint,
+            "auto_opened": auto_opened,
+        }
+
+    resp_hex = response_bytes.hex().upper()
+    rc = "??"
+    decode_error = None
+    try:
+        resp_meta = decode_message(resp_hex, "visa", wire_format=wire_format)
+        for fobj in resp_meta.get("fields", []):
+            if fobj["field"] == 39:
+                rc = str(fobj["value"]).strip() or "??"
+                break
+    except Exception as dec_err:
+        decode_error = str(dec_err)
+
+    return {
+        "ok": rc == "00" and decode_error is None,
+        "stage": "complete",
+        "framing": {"wire_format": wire_format, "length_header": length_header, "ws_text_mode": text_mode},
+        "request_hex": req_hex,
+        "response_hex": resp_hex,
+        "response_code": rc,
+        "response_description": RESPONSE_CODES.get(rc, "Unknown"),
+        "decode_error": decode_error,
+        "auto_opened": auto_opened,
+    }
+
+
 @api.post("/iso/send-tcp")
 async def send_over_tcp_endpoint(body: TcpSendRequest, user=Depends(get_current_user)):
     """Encode an ISO-8583 message and send it over the profile's transport
