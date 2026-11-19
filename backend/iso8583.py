@@ -794,7 +794,7 @@ def simulate_response(
     """
     from sim_crypto import run_issuer_checks, build_arpc_tlv
 
-    crypto = run_issuer_checks(request_mti, data_elements, keyset) if keyset else None
+    crypto = run_issuer_checks(request_mti, data_elements, keyset, network_id) if keyset else None
     last_two = request_mti[-2:]
     response_mti = request_mti[:2] + (f"{int(last_two) + 10:02d}" if last_two.isdigit() else "10")
 

@@ -9,8 +9,13 @@ request carries and `build_arpc_tlv` answers a verified ARQC:
   - PIN          (F52)  : decrypt the ISO-0 3DES PIN block under the PEK
                           (key set extra ZPK, PEK or TPK) and check it against
                           the PVKI/PVV in track 2 under PVK_A/PVK_B.
-  - ARQC         (F55)  : Visa CVN10 / CVN18 under the MDK, CVN read from
-                          byte 2 of IAD (9F10), formats 0/1/3.
+  - ARQC         (F55)  : under the MDK. The CVN is read from IAD (9F10):
+                            Visa (formats 0/1/3)  byte 2: 0A=CVN10, 12=CVN18,
+                                                  CVR = bytes 3-6
+                            Mastercard M/Chip     byte 1: 10/11/14/15 = CVN16/17/20/21,
+                                                  CVR = bytes 2-7, counters = bytes 10-17
+                          The request's network picks the layout; other networks
+                          try Visa, then Mastercard.
 
 Track 2 discretionary data uses the common Visa layout:
     PVKI(1) || PVV(4) || CVV(3) || ...
@@ -24,8 +29,7 @@ import hmac
 from typing import Dict, List, Optional, Tuple
 
 from key_management import (
-    compute_arpc, compute_arpc_method2, compute_arqc, compute_cvv, compute_pvv,
-    derive_icc_mk, derive_session_key_cvn18,
+    compute_arpc, compute_arpc_method2, compute_arqc, compute_cvv, compute_pvv, derive_ac_keys,
 )
 from pin_crypto import decrypt_pin_block
 
@@ -36,9 +40,38 @@ RC_FORMAT = "30"          # Format error
 
 PEK_ALIASES = ("ZPK", "PEK", "TPK")
 
-# Tags that make up the Visa CVN10 / CVN18 ARQC input, in order.
-VISA_AC_TAGS = ("9F02", "9F03", "9F1A", "95", "5F2A", "9A", "9C", "9F37", "82", "9F36")
-CVN_BY_BYTE = {0x0A: "CVN10", 0x12: "CVN18"}
+# Terminal/card tags that make up the Visa and Mastercard ARQC input, in order.
+AC_TAGS = ("9F02", "9F03", "9F1A", "95", "5F2A", "9A", "9C", "9F37", "82", "9F36")
+VISA_CVNS = {0x0A: "CVN10", 0x12: "CVN18"}
+MC_CVNS = {0x10: "MC_CVN16", 0x11: "MC_CVN17", 0x14: "MC_CVN20", 0x15: "MC_CVN21"}
+
+
+def detect_cvn(iad: bytes, network_id: Optional[str] = None) -> Optional[Tuple[str, bytes]]:
+    """Return (cvn, extra MAC data taken from the IAD) or None if unsupported."""
+    def visa():
+        if len(iad) >= 7 and iad[2] in VISA_CVNS:
+            cvn = VISA_CVNS[iad[2]]
+            return cvn, (iad[3:7] if cvn == "CVN10" else iad)
+        return None
+
+    def mastercard():
+        if len(iad) >= 8 and iad[1] in MC_CVNS:
+            cvn = MC_CVNS[iad[1]]
+            extra = iad[2:8]                                  # CVR
+            if cvn in ("MC_CVN17", "MC_CVN21"):
+                if len(iad) < 18:
+                    return None
+                extra += iad[10:18]                           # counters
+            return cvn, extra
+        return None
+
+    net = (network_id or "").lower()
+    order = {"visa": (visa,), "mastercard": (mastercard,)}.get(net, (visa, mastercard))
+    for fn in order:
+        found = fn()
+        if found:
+            return found
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +184,8 @@ def _check_pin(de: Dict, keyset: Dict, t2: Optional[Dict]) -> Tuple[Dict, Option
     return {"check": name, "result": "fail", "detail": "PIN does not match PVV"}, RC_PIN_WRONG
 
 
-def _check_arqc(de: Dict, keyset: Dict, t2: Optional[Dict]) -> Tuple[Dict, Optional[str], Optional[Dict]]:
+def _check_arqc(de: Dict, keyset: Dict, t2: Optional[Dict],
+                network_id: Optional[str] = None) -> Tuple[Dict, Optional[str], Optional[Dict]]:
     name = "ARQC (F55)"
     icc = _get(de, 55)
     if not icc:
@@ -165,35 +199,34 @@ def _check_arqc(de: Dict, keyset: Dict, t2: Optional[Dict]) -> Tuple[Dict, Optio
     if "9F26" not in tags:
         return {"check": name, "result": "skipped", "detail": "F55 has no ARQC (9F26)"}, None, None
     iad = bytes.fromhex(tags.get("9F10", ""))
-    missing = [t for t in VISA_AC_TAGS if t not in tags] + ([] if iad else ["9F10"])
+    missing = [t for t in AC_TAGS if t not in tags] + ([] if iad else ["9F10"])
     if missing:
         return {"check": name, "result": "fail", "detail": f"F55 is missing {', '.join(missing)}"}, RC_FORMAT, None
-    cvn = CVN_BY_BYTE.get(iad[2]) if len(iad) >= 7 else None
-    if not cvn:
+    found = detect_cvn(iad, network_id)
+    if not found:
         return {"check": name, "result": "fail",
-                "detail": f"unsupported IAD / CVN (9F10={iad.hex().upper()}); CVN10 and CVN18 are supported"}, RC_FORMAT, None
+                "detail": f"unsupported IAD / CVN (9F10={iad.hex().upper()}); supported: Visa CVN10/18, "
+                          "Mastercard CVN16/17/20/21"}, RC_FORMAT, None
+    cvn, iad_data = found
 
     pan = _get(de, 2) or (t2 or {}).get("pan", "")
     psn = tags.get("5F34") or _get(de, 23)[-2:] or "00"
     atc = tags["9F36"]
-    data = "".join(tags[t] for t in VISA_AC_TAGS)
+    data = "".join(tags[t] for t in AC_TAGS) + iad_data.hex()
     try:
-        if cvn == "CVN10":
-            sk = derive_icc_mk(keyset["mdk_hex"], pan, psn, option="A")
-            expected = compute_arqc(sk, data + iad[3:7].hex(), padding="VISA")
-        else:
-            icc_mk = derive_icc_mk(keyset["mdk_hex"], pan, psn, option="B")
-            sk = derive_session_key_cvn18(icc_mk, atc)
-            expected = compute_arqc(sk, data + iad.hex(), padding="EMV")
+        keys = derive_ac_keys(cvn, keyset["mdk_hex"], pan, psn, atc, tags["9F37"])
+        expected = compute_arqc(keys["sk"], data, padding=keys["padding"])
     except ValueError as e:
         return {"check": name, "result": "fail", "detail": str(e)}, RC_FORMAT, None
+    label = cvn.replace("MC_", "Mastercard ") if cvn.startswith("MC_") else f"Visa {cvn}"
     if _same(expected, tags["9F26"]):
-        ctx = {"cvn": cvn, "sk": sk, "arqc": tags["9F26"]}
-        return {"check": name, "result": "pass", "detail": f"Visa {cvn} ARQC matches (ATC {atc})"}, None, ctx
-    return {"check": name, "result": "fail", "detail": f"Visa {cvn} ARQC does not match"}, RC_CRYPTO_FAIL, None
+        ctx = {"cvn": cvn, "sk": keys["sk"], "arpc_key": keys["arpc_key"],
+               "arpc_method": keys["arpc_method"], "arqc": tags["9F26"]}
+        return {"check": name, "result": "pass", "detail": f"{label} ARQC matches (ATC {atc})"}, None, ctx
+    return {"check": name, "result": "fail", "detail": f"{label} ARQC does not match"}, RC_CRYPTO_FAIL, None
 
 
-def run_issuer_checks(request_mti: str, de: Dict, keyset: Dict) -> Dict:
+def run_issuer_checks(request_mti: str, de: Dict, keyset: Dict, network_id: Optional[str] = None) -> Dict:
     """Run every applicable check. Returns {"rc": str|None, "checks": [...], "arpc_ctx": dict|None}.
 
     `rc` is the response code of the first failing check in issuer order
@@ -202,7 +235,7 @@ def run_issuer_checks(request_mti: str, de: Dict, keyset: Dict) -> Dict:
     if request_mti.startswith("08"):
         return {"rc": None, "checks": [], "arpc_ctx": None}
     t2 = parse_track2(_get(de, 35))
-    arqc_check, arqc_rc, ctx = _check_arqc(de, keyset, t2)
+    arqc_check, arqc_rc, ctx = _check_arqc(de, keyset, t2, network_id)
     cvv_check = _check_cvv(de, keyset, t2)
     pin_check, pin_rc = _check_pin(de, keyset, t2)
     cvv_rc = RC_CRYPTO_FAIL if cvv_check["result"] == "fail" else None
@@ -213,11 +246,12 @@ def run_issuer_checks(request_mti: str, de: Dict, keyset: Dict) -> Dict:
 def build_arpc_tlv(ctx: Dict, response_code: str) -> str:
     """F55 response with tag 91 for a verified ARQC.
 
-    CVN10: Method 1, ARC = ASCII of the response code (e.g. "00" -> 3030).
-    CVN18: Method 2 with CSU 00000000; CSU contents are not modelled.
+    Method 1 (Visa CVN10, Mastercard): ARC = ASCII of the response code ("00" -> 3030),
+      under the ICC MK (CVN10, MC CVN16/17) or the session key (MC CVN20/21).
+    Method 2 (Visa CVN18): CSU 00000000; CSU contents are not modelled.
     """
-    if ctx["cvn"] == "CVN10":
+    if ctx["arpc_method"] == 1:
         arc = (response_code or "  ")[:2].encode("ascii").hex().upper()
-        return _tlv("91", compute_arpc(ctx["sk"], ctx["arqc"], arc, "3DES") + arc)
+        return _tlv("91", compute_arpc(ctx["arpc_key"], ctx["arqc"], arc, "3DES") + arc)
     csu = "00000000"
     return _tlv("91", compute_arpc_method2(ctx["sk"], ctx["arqc"], csu) + csu)

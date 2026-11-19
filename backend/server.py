@@ -45,6 +45,7 @@ from key_management import (
     derive_icc_mk, compute_arqc,
     derive_session_key_cvn18, derive_icc_mk_aes, derive_session_key_aes, compute_arqc_aes,
     compute_arpc, compute_arpc_method2,
+    derive_ac_keys, compute_ibm3624_offset, compute_ibm3624_pin, DEFAULT_DECIMALIZATION_TABLE,
 )
 from session_manager import (
     connect_session,
@@ -269,8 +270,9 @@ class ArqcRequest(BaseModel):
     pan: str
     psn: str = "00"
     cdol_hex: str
-    cvn: str = "CVN10"            # CVN10 | CVN18 | AES
-    atc_hex: Optional[str] = None  # required for CVN18 / AES
+    cvn: str = "CVN10"            # CVN10 | CVN18 | MC_CVN16 | MC_CVN17 | MC_CVN20 | MC_CVN21 | AES
+    atc_hex: Optional[str] = None  # 9F36; required for every CVN except CVN10
+    un_hex: Optional[str] = None   # 9F37; required for MC_CVN16 / MC_CVN17
 
 
 class CvvVerifyRequest(CvvRequest):
@@ -285,6 +287,34 @@ class PvvVerifyRequest(BaseModel):
     pvki: str = "1"
     pvk_a_hex: str
     pvk_b_hex: str
+    pin: Optional[str] = None
+    pin_block_hex: Optional[str] = None
+    pek_hex: Optional[str] = None
+    pin_format: str = "ISO-0"
+    pin_algorithm: str = "3DES"
+
+
+class Ibm3624Request(BaseModel):
+    """IBM 3624 PIN offset. Validation data = PAN[verify_offset : verify_offset + verify_length],
+    right-padded to 16 hex digits with `pad`."""
+    pan: str
+    pin: str
+    pvk_hex: str                                   # 8, 16 or 24 bytes
+    decimalization_table: str = DEFAULT_DECIMALIZATION_TABLE
+    verify_offset: int = 0
+    verify_length: Optional[int] = None            # default: rest of the PAN, max 16
+    pad: str = "F"
+
+
+class Ibm3624VerifyRequest(BaseModel):
+    """Verify a PIN against an IBM 3624 offset; PIN given clear or as an encrypted PIN block."""
+    pan: str
+    offset: str
+    pvk_hex: str
+    decimalization_table: str = DEFAULT_DECIMALIZATION_TABLE
+    verify_offset: int = 0
+    verify_length: Optional[int] = None
+    pad: str = "F"
     pin: Optional[str] = None
     pin_block_hex: Optional[str] = None
     pek_hex: Optional[str] = None
@@ -1030,27 +1060,16 @@ async def keys_pvv(body: PvvRequest, _user=Depends(get_current_user)):
 
 def _compute_arqc(body: ArqcRequest) -> dict:
     """Shared by /keys/arqc and /keys/arqc/verify. Raises ValueError on bad input."""
+    keys: dict = {}
     if body.cvn == "AES":
         icc_mk = derive_icc_mk_aes(body.mdk_hex, body.pan, body.psn)
         sk = derive_session_key_aes(icc_mk, body.atc_hex or "0000")
         arqc = compute_arqc_aes(sk, body.cdol_hex)
         algo = "AES"
     else:
-        if body.cvn == "CVN18":
-            # Visa CVN18: ICC MK Option B, EMV common session key, EMV (0x80) padding.
-            if not body.atc_hex:
-                raise ValueError("ATC is required for CVN18 derivation.")
-            icc_mk = derive_icc_mk(body.mdk_hex, body.pan, body.psn, option="B")
-            sk = derive_session_key_cvn18(icc_mk, body.atc_hex)
-            padding = "EMV"
-        elif body.cvn == "CVN10":
-            # Visa CVN10: ICC MK Option A, no session key, Visa (zero) padding.
-            icc_mk = derive_icc_mk(body.mdk_hex, body.pan, body.psn, option="A")
-            sk = icc_mk
-            padding = "VISA"
-        else:
-            raise ValueError("cvn must be CVN10, CVN18 or AES.")
-        arqc = compute_arqc(sk, body.cdol_hex, padding=padding)
+        keys = derive_ac_keys(body.cvn, body.mdk_hex, body.pan, body.psn, body.atc_hex, body.un_hex)
+        icc_mk, sk = keys["icc_mk"], keys["sk"]
+        arqc = compute_arqc(sk, body.cdol_hex, padding=keys["padding"])
         algo = "3DES"
     return {
         "cvn": body.cvn,
@@ -1061,6 +1080,9 @@ def _compute_arqc(body: ArqcRequest) -> dict:
         "mdk_kcv": compute_kcv(body.mdk_hex, algo),
         "icc_mk_kcv": compute_kcv(icc_mk, algo),
         "session_key_kcv": compute_kcv(sk, algo),
+        # Key and method the issuer uses to answer with an ARPC (POST /keys/arpc).
+        "arpc_key_hex": keys["arpc_key"] if algo == "3DES" else sk,
+        "arpc_method": keys["arpc_method"] if algo == "3DES" else 1,
     }
 
 
@@ -1121,6 +1143,44 @@ async def keys_pvv_verify(body: PvvVerifyRequest, _user=Depends(get_current_user
     return {"valid": _same(expected, body.pvv), "pvki": body.pvki, "pin_source": source, "pvk_kcv": kcv}
 
 
+def _ibm3624_args(body) -> dict:
+    return dict(table=body.decimalization_table, verify_offset=body.verify_offset,
+                verify_length=body.verify_length, pad=body.pad)
+
+
+@api.post("/keys/ibm3624")
+async def keys_ibm3624(body: Ibm3624Request, _user=Depends(get_current_user)):
+    try:
+        offset = compute_ibm3624_offset(body.pvk_hex, body.pin, body.pan, **_ibm3624_args(body))
+        kcv = compute_kcv(body.pvk_hex, "3DES")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"offset": offset, "pvk_kcv": kcv}
+
+
+@api.post("/keys/ibm3624/verify")
+async def keys_ibm3624_verify(body: Ibm3624VerifyRequest, _user=Depends(get_current_user)):
+    try:
+        if body.pin_block_hex:
+            if body.pin:
+                raise ValueError("Give either pin or pin_block_hex, not both.")
+            if not body.pek_hex:
+                raise ValueError("pek_hex is required with pin_block_hex.")
+            pin = decrypt_pin_block(body.pin_block_hex, body.pan, body.pek_hex,
+                                    body.pin_format, body.pin_algorithm)
+            source = "pin_block"
+        elif body.pin:
+            pin, source = body.pin, "clear"
+        else:
+            raise ValueError("Give pin or pin_block_hex.")
+        expected = compute_ibm3624_pin(body.pvk_hex, body.offset, body.pan, **_ibm3624_args(body))
+        kcv = compute_kcv(body.pvk_hex, "3DES")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # PIN length must equal offset length; compare in constant time.
+    return {"valid": len(pin) == len(expected) and _same(expected, pin), "pin_source": source, "pvk_kcv": kcv}
+
+
 @api.post("/keys/arqc/verify")
 async def keys_arqc_verify(body: ArqcVerifyRequest, _user=Depends(get_current_user)):
     try:
@@ -1137,6 +1197,8 @@ async def keys_arqc_verify(body: ArqcVerifyRequest, _user=Depends(get_current_us
         "session_key_kcv": res["session_key_kcv"],
         # Needed by the issuer to build the ARPC once the ARQC is accepted.
         "session_key_hex": res["session_key_hex"] if valid else None,
+        "arpc_key_hex": res["arpc_key_hex"] if valid else None,
+        "arpc_method": res["arpc_method"],
     }
 
 

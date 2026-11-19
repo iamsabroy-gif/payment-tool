@@ -342,3 +342,112 @@ def compute_arpc_method2(sk_hex: str, arqc_hex: str, csu_hex: str, pad_hex: str 
         raise ValueError("Proprietary Authentication Data must be 0-8 bytes.")
     mac = compute_arqc(sk_hex, (arqc + csu + pad).hex(), padding="EMV")
     return mac[:8]
+
+
+# ---------------------------------------------------------------------------
+# Mastercard M/Chip session key (CVN16 / CVN17)
+# ---------------------------------------------------------------------------
+def derive_session_key_mastercard(icc_mk_hex: str, atc_hex: str, un_hex: str) -> str:
+    """Mastercard proprietary SKD: EMV common session key derivation with the
+    diversification value R = ATC(2) || 00 00 || UN(4), i.e.
+      SK_L = 3DES_MK(ATC || F0 || 00 || UN),  SK_R = 3DES_MK(ATC || 0F || 00 || UN)
+    """
+    icc_mk = _normalise_3des_key(icc_mk_hex)
+    atc = bytes.fromhex(atc_hex.replace(" ", "").rjust(4, "0"))[-2:]
+    un = bytes.fromhex((un_hex or "").replace(" ", ""))
+    if len(un) != 4:
+        raise ValueError("Unpredictable number (9F37) must be 4 bytes (8 hex chars).")
+    sk = _ecb_3des(icc_mk, atc + b"\xF0\x00" + un) + _ecb_3des(icc_mk, atc + b"\x0F\x00" + un)
+    return _force_odd_parity(sk).hex().upper()
+
+
+# ---------------------------------------------------------------------------
+# Cryptogram profiles: which keys, padding and ARPC method each CVN uses
+# ---------------------------------------------------------------------------
+TDES_CVNS = ("CVN10", "CVN18", "MC_CVN16", "MC_CVN17", "MC_CVN20", "MC_CVN21")
+
+
+def derive_ac_keys(cvn: str, mdk_hex: str, pan: str, psn: str = "00",
+                   atc_hex: str | None = None, un_hex: str | None = None) -> dict:
+    """Return the keys and rules for a 3DES cryptogram version:
+
+      icc_mk      ICC master key
+      sk          key the ARQC MAC runs under
+      padding     "VISA" (zeros) or "EMV" (0x80)
+      arpc_key    key the ARPC is computed under
+      arpc_method 1 or 2
+
+    Visa CVN10   Option A, SK = ICC MK, Visa padding, ARPC M1 under ICC MK
+    Visa CVN18   Option B, EMV CSK(ATC), EMV padding, ARPC M2 under SK
+    MC CVN16/17  Option A, Mastercard SKD(ATC, UN), EMV padding, ARPC M1 under ICC MK
+    MC CVN20/21  Option A, EMV CSK(ATC), EMV padding, ARPC M1 under SK
+    (CVN17/21 also MAC the IAD counters; the caller includes them in the data.)
+    """
+    if cvn not in TDES_CVNS:
+        raise ValueError(f"cvn must be one of {', '.join(TDES_CVNS)} or AES.")
+    needs_atc = cvn != "CVN10"
+    if needs_atc and not atc_hex:
+        raise ValueError(f"ATC is required for {cvn} (tag 9F36).")
+    if cvn in ("MC_CVN16", "MC_CVN17") and not un_hex:
+        raise ValueError(f"Unpredictable number is required for {cvn} (tag 9F37).")
+
+    icc_mk = derive_icc_mk(mdk_hex, pan, psn, option="B" if cvn == "CVN18" else "A")
+    if cvn == "CVN10":
+        sk, padding, arpc_key, method = icc_mk, "VISA", icc_mk, 1
+    elif cvn == "CVN18":
+        sk = derive_session_key_cvn18(icc_mk, atc_hex)
+        padding, arpc_key, method = "EMV", sk, 2
+    elif cvn in ("MC_CVN16", "MC_CVN17"):
+        sk = derive_session_key_mastercard(icc_mk, atc_hex, un_hex)
+        padding, arpc_key, method = "EMV", icc_mk, 1
+    else:  # MC_CVN20 / MC_CVN21
+        sk = derive_session_key_cvn18(icc_mk, atc_hex)
+        padding, arpc_key, method = "EMV", sk, 1
+    return {"icc_mk": icc_mk, "sk": sk, "padding": padding, "arpc_key": arpc_key, "arpc_method": method}
+
+
+# ---------------------------------------------------------------------------
+# IBM 3624 PIN offset
+# ---------------------------------------------------------------------------
+DEFAULT_DECIMALIZATION_TABLE = "0123456789012345"
+
+
+def _ibm3624_intermediate(pvk_hex: str, pan: str, table: str, verify_offset: int,
+                          verify_length: int | None, pad: str) -> str:
+    pan = "".join(c for c in pan if c.isdigit())
+    table = (table or DEFAULT_DECIMALIZATION_TABLE).strip()
+    if len(table) != 16 or not table.isdigit():
+        raise ValueError("Decimalization table must be 16 decimal digits.")
+    pad = (pad or "F").upper()
+    if len(pad) != 1 or pad not in "0123456789ABCDEF":
+        raise ValueError("PAN pad character must be one hex digit.")
+    if verify_length is None:
+        verify_length = min(len(pan) - verify_offset, 16)
+    if verify_offset < 0 or verify_length < 1 or verify_length > 16:
+        raise ValueError("Validation data length must be 1-16 digits.")
+    data = pan[verify_offset:verify_offset + verify_length]
+    if len(data) != verify_length:
+        raise ValueError("Validation data offset/length fall outside the PAN.")
+    block = bytes.fromhex(data.ljust(16, pad))
+    enc = _ecb_3des(_normalise_3des_key(pvk_hex), block).hex().upper()
+    return enc.translate(str.maketrans("0123456789ABCDEF", table))
+
+
+def compute_ibm3624_offset(pvk_hex: str, pin: str, pan: str, table: str = DEFAULT_DECIMALIZATION_TABLE,
+                           verify_offset: int = 0, verify_length: int | None = None, pad: str = "F") -> str:
+    """Offset = (PIN - natural PIN) mod 10, digit by digit. Offset length = PIN length (4-12)."""
+    pin = "".join(c for c in (pin or "") if c.isdigit())
+    if not 4 <= len(pin) <= 12:
+        raise ValueError("PIN must be 4-12 digits.")
+    natural = _ibm3624_intermediate(pvk_hex, pan, table, verify_offset, verify_length, pad)
+    return "".join(str((int(p) - int(n)) % 10) for p, n in zip(pin, natural))
+
+
+def compute_ibm3624_pin(pvk_hex: str, offset: str, pan: str, table: str = DEFAULT_DECIMALIZATION_TABLE,
+                        verify_offset: int = 0, verify_length: int | None = None, pad: str = "F") -> str:
+    """PIN = (natural PIN + offset) mod 10, digit by digit."""
+    offset = (offset or "").strip()
+    if not (offset.isdigit() and 4 <= len(offset) <= 12):
+        raise ValueError("Offset must be 4-12 digits.")
+    natural = _ibm3624_intermediate(pvk_hex, pan, table, verify_offset, verify_length, pad)
+    return "".join(str((int(o) + int(n)) % 10) for o, n in zip(offset, natural))
