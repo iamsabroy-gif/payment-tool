@@ -11,6 +11,7 @@ Real production must run inside a PCI-PIN HSM.
 """
 from __future__ import annotations
 
+import hashlib
 from typing import Tuple
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -154,18 +155,27 @@ def _decimalise(hex_str: str, digits: int) -> str:
 # ---------------------------------------------------------------------------
 # EMV ICC Master Key derivation (Method A) + ARQC
 # ---------------------------------------------------------------------------
-def derive_icc_mk(mdk_hex: str, pan: str, psn: str = "00") -> str:
-    """EMV ICC Master Key, Method A.
+def derive_icc_mk(mdk_hex: str, pan: str, psn: str = "00", option: str = "A") -> str:
+    """EMV ICC Master Key derivation (EMV Book 2, Annex A1.4).
 
+    Option A:
       Y = rightmost 16 digits of (PAN || PSN), zero-padded on the left if needed
+    Option B (used e.g. by Visa CVN18/CVN22; identical to Option A for PAN <= 16 digits):
+      X = PAN || PSN, left-padded with one '0' if odd length
+      Y = first 16 decimal digits of SHA-1(X) (hex A-F -> 0-5 used if fewer than 16)
+    Then for both:
       Z = Y XOR 0xFFFFFFFFFFFFFFFF
-      ICC MK left  = 3DES_MDK(Y)
-      ICC MK right = 3DES_MDK(Z)
-      ICC MK       = left || right   (16 bytes / 32 hex)
+      ICC MK = 3DES_MDK(Y) || 3DES_MDK(Z), odd parity (16 bytes / 32 hex)
     """
     pan = "".join(c for c in pan if c.isdigit())
     psn = "".join(c for c in (psn or "00") if c.isdigit()).zfill(2)[:2]
-    src = (pan + psn).rjust(16, "0")[-16:]
+    option = (option or "A").upper()
+    if option not in ("A", "B"):
+        raise ValueError("option must be 'A' or 'B'")
+    if option == "B" and len(pan) > 16:
+        src = _option_b_y(pan, psn)
+    else:
+        src = (pan + psn).rjust(16, "0")[-16:]
     Y = bytes.fromhex(src)
     Z = bytes(b ^ 0xFF for b in Y)
 
@@ -178,6 +188,18 @@ def derive_icc_mk(mdk_hex: str, pan: str, psn: str = "00") -> str:
     return _force_odd_parity(icc_mk).hex().upper()
 
 
+def _option_b_y(pan: str, psn: str) -> str:
+    """EMV Option B: 16 decimal digits from SHA-1(PAN || PSN)."""
+    x = pan + psn
+    if len(x) % 2:
+        x = "0" + x
+    digest = hashlib.sha1(bytes.fromhex(x)).hexdigest().upper()
+    digits = [c for c in digest if c.isdigit()]
+    if len(digits) < 16:
+        digits += [str(int(c, 16) - 10) for c in digest if not c.isdigit()]
+    return "".join(digits[:16])
+
+
 def _force_odd_parity(data: bytes) -> bytes:
     out = bytearray()
     for b in data:
@@ -188,12 +210,16 @@ def _force_odd_parity(data: bytes) -> bytes:
     return bytes(out)
 
 
-def compute_arqc(icc_mk_hex: str, cdol_hex: str) -> str:
-    """ARQC = retail MAC (ISO/IEC 9797-1 algorithm 3) over CDOL data using ICC MK as the key.
+def compute_arqc(icc_mk_hex: str, cdol_hex: str, padding: str = "EMV") -> str:
+    """ARQC = retail MAC (ISO/IEC 9797-1 algorithm 3) over CDOL data.
 
-    For CVN10 the session key equals the ICC MK; we don't apply further session-key
-    derivation here — pass the session key directly as `icc_mk_hex` if your scheme
-    requires CVN18 derivation upstream.
+    `icc_mk_hex` is the key the MAC runs under: the ICC MK itself for Visa CVN10,
+    or the session key (see derive_session_key_cvn18) for CVN18 / M/Chip.
+
+    padding:
+      "VISA" - ISO/IEC 9797-1 method 1: zero bytes to an 8-byte boundary, nothing
+               added if already aligned (Visa CVN10).
+      "EMV"  - ISO/IEC 9797-1 method 2: 0x80 then zeros (Visa CVN18, Mastercard).
     """
     sk = bytes.fromhex(icc_mk_hex.replace(" ", ""))
     if len(sk) != 16:
@@ -202,8 +228,13 @@ def compute_arqc(icc_mk_hex: str, cdol_hex: str) -> str:
     K2 = sk[8:]
 
     data = bytes.fromhex((cdol_hex or "").replace(" ", ""))
-    # Mandatory padding: 0x80 then zeros to 8-byte boundary
-    data += b"\x80"
+    padding = (padding or "EMV").upper()
+    if padding == "EMV":
+        data += b"\x80"
+    elif padding != "VISA":
+        raise ValueError("padding must be 'EMV' or 'VISA'")
+    if not data:
+        data = b"\x00" * 8
     while len(data) % 8 != 0:
         data += b"\x00"
 
@@ -263,7 +294,7 @@ def compute_arqc_aes(sk_hex: str, cdol_hex: str) -> str:
 # ARPC — issuer-side response cryptogram (VAC / Mastercard ARPC, Method 1)
 # ---------------------------------------------------------------------------
 def compute_arpc(sk_hex: str, arqc_hex: str, arc_hex: str, algorithm: str = "3DES") -> str:
-    """ARPC Method 1: encrypt(SK, ARQC XOR (ARC || zero-pad)).
+    """ARPC Method 1: encrypt(SK, ARQC XOR (ARC || zero-pad)). Always 8 bytes.
 
     `arc_hex` is the 2-byte (4-hex) Authorization Response Code, e.g.
     `3030` for ASCII "00" approved, `3035` for "05" decline, etc.
@@ -283,6 +314,8 @@ def compute_arpc(sk_hex: str, arqc_hex: str, arc_hex: str, algorithm: str = "3DE
         sk = _normalise_aes_key(sk_hex)
         block = (arqc + b"\x00" * 16)[:16]
         block = _xor(block, arc + b"\x00" * 14)
-        return _ecb_aes(sk, block).hex().upper()
+        # Keep the leftmost 8 bytes: tag 91 (ARPC || ARC) is limited to 16 bytes,
+        # so a full 16-byte block plus the 2-byte ARC cannot be carried.
+        return _ecb_aes(sk, block)[:8].hex().upper()
     else:
         raise ValueError("algorithm must be 3DES or AES")

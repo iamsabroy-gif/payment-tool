@@ -220,6 +220,8 @@ function ArqcTab({ builderState, onInsertField, onClose }) {
     const [mdk, setMdk] = useState("0123456789ABCDEFFEDCBA9876543210");
     const [pan, setPan] = useState(builderState?.values?.[2] || "");
     const [psn, setPsn] = useState("00");
+    const [cvn, setCvn] = useState("CVN10");
+    const [atc, setAtc] = useState("0001");
     const [cdol, setCdol] = useState("");
     const [res, setRes] = useState(null);
     const [busy, setBusy] = useState(false);
@@ -227,7 +229,10 @@ function ArqcTab({ builderState, onInsertField, onClose }) {
     const compute = async () => {
         setBusy(true);
         try {
-            const { data } = await api.post("/keys/arqc", { mdk_hex: mdk, pan, psn, cdol_hex: cdol });
+            const { data } = await api.post("/keys/arqc", {
+                mdk_hex: mdk, pan, psn, cdol_hex: cdol, cvn,
+                atc_hex: cvn === "CVN10" ? null : atc,
+            });
             setRes(data);
         } catch (e) { toast.error(apiErr(e)); }
         finally { setBusy(false); }
@@ -242,14 +247,29 @@ function ArqcTab({ builderState, onInsertField, onClose }) {
 
     return (
         <>
-            <p className="text-xs text-[#4B5563]">EMV: derive ICC MK from MDK using Method A (PAN || PSN), apply odd parity, then ARQC = retail MAC (ISO/IEC 9797-1 alg 3) over your CDOL bytes.</p>
+            <p className="text-xs text-[#4B5563]">
+                CVN10: ICC MK (Option A) is the MAC key, Visa zero padding.
+                CVN18: ICC MK (Option B) → session key from ATC, EMV 0x80 padding; include the IAD (9F10) at the end of the CDOL data.
+                AES: AES ICC MK → session key → AES-CMAC.
+            </p>
             <div className="grid grid-cols-1 gap-3">
-                <Field label="MDK (16 or 24 bytes hex)"><input data-testid="arqc-mdk" value={mdk} onChange={(e) => setMdk(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
+                <Field label={cvn === "AES" ? "MDK (16/24/32 bytes hex)" : "MDK (16 or 24 bytes hex)"}><input data-testid="arqc-mdk" value={mdk} onChange={(e) => setMdk(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
                 <div className="grid grid-cols-3 gap-3">
                     <Field label="PAN"><input data-testid="arqc-pan" value={pan} onChange={(e) => setPan(e.target.value.replace(/\D/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
                     <Field label="PSN"><input data-testid="arqc-psn" value={psn} maxLength={2} onChange={(e) => setPsn(e.target.value.replace(/\D/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
-                    <div />
+                    <Field label="CVN">
+                        <select data-testid="arqc-cvn-select" value={cvn} onChange={(e) => setCvn(e.target.value)} className="w-full h-9 border border-gray-300 px-2 text-sm bg-white">
+                            <option value="CVN10">Visa CVN10</option>
+                            <option value="CVN18">Visa CVN18</option>
+                            <option value="AES">AES</option>
+                        </select>
+                    </Field>
                 </div>
+                {cvn !== "CVN10" && (
+                    <Field label="ATC (9F36, 2 bytes hex)">
+                        <input data-testid="arqc-atc" value={atc} maxLength={4} onChange={(e) => setAtc(e.target.value.toUpperCase().replace(/[^0-9A-F]/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
+                    </Field>
+                )}
                 <Field label="CDOL data (hex; concatenation per CDOL1)">
                     <textarea
                         data-testid="arqc-cdol"
@@ -269,6 +289,9 @@ function ArqcTab({ builderState, onInsertField, onClose }) {
                     <ResultLine label="MDK KCV"     value={res.mdk_kcv} testid="arqc-mdk-kcv" />
                     <ResultLine label="ICC MK"      value={res.icc_mk_hex} testid="arqc-icc-mk" />
                     <ResultLine label="ICC MK KCV"  value={res.icc_mk_kcv} testid="arqc-icc-kcv" />
+                    {res.session_key_hex !== res.icc_mk_hex && (
+                        <ResultLine label="Session key" value={res.session_key_hex} testid="arqc-sk" />
+                    )}
                     <ResultLine label="ARQC"        value={res.arqc_hex} accent testid="arqc-value" />
                     <ResultLine label="F55 TLV"     value={res.f55_tlv_hex} testid="arqc-f55-tlv" />
                     <button onClick={insertF55} data-testid="arqc-insert-f55" className="h-9 px-4 bg-[#002FA7] text-white text-xs font-semibold hover:bg-[#002080] flex items-center gap-2">

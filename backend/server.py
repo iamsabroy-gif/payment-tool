@@ -997,14 +997,21 @@ async def keys_arqc(body: ArqcRequest, _user=Depends(get_current_user)):
             sk_kcv = compute_kcv(sk, "AES")
             algo = "AES"
         else:
-            icc_mk = derive_icc_mk(body.mdk_hex, body.pan, body.psn)
             if body.cvn == "CVN18":
+                # Visa CVN18: ICC MK Option B, EMV common session key, EMV (0x80) padding.
                 if not body.atc_hex:
                     raise ValueError("ATC is required for CVN18 derivation.")
+                icc_mk = derive_icc_mk(body.mdk_hex, body.pan, body.psn, option="B")
                 sk = derive_session_key_cvn18(icc_mk, body.atc_hex)
-            else:  # CVN10 or default — SK = ICC MK
+                padding = "EMV"
+            elif body.cvn == "CVN10":
+                # Visa CVN10: ICC MK Option A, no session key, Visa (zero) padding.
+                icc_mk = derive_icc_mk(body.mdk_hex, body.pan, body.psn, option="A")
                 sk = icc_mk
-            arqc = compute_arqc(sk, body.cdol_hex)
+                padding = "VISA"
+            else:
+                raise ValueError("cvn must be CVN10, CVN18 or AES.")
+            arqc = compute_arqc(sk, body.cdol_hex, padding=padding)
             mdk_kcv = compute_kcv(body.mdk_hex, "3DES")
             icc_kcv = compute_kcv(icc_mk, "3DES")
             sk_kcv = compute_kcv(sk, "3DES")
@@ -1021,24 +1028,33 @@ async def keys_arqc(body: ArqcRequest, _user=Depends(get_current_user)):
         "icc_mk_kcv": icc_kcv,
         "session_key_kcv": sk_kcv,
         # Pre-built BER-TLV bytes for F55 (tag 9F26 = ARQC, length 08)
-        "f55_tlv_hex": f"9F2608{arqc}",
+        "f55_tlv_hex": _tlv("9F26", arqc),
     }
+
+
+def _tlv(tag: str, value_hex: str) -> str:
+    """Encode a short BER-TLV (value < 128 bytes)."""
+    n = len(value_hex) // 2
+    if n > 127:
+        raise ValueError("TLV value too long for short-form length.")
+    return f"{tag}{n:02X}{value_hex}"
 
 
 @api.post("/keys/arpc")
 async def keys_arpc(body: ArpcRequest, _user=Depends(get_current_user)):
     try:
         arpc = compute_arpc(body.sk_hex, body.arqc_hex, body.arc_hex, body.algorithm)
+        arc4 = body.arc_hex.replace(" ", "").upper().ljust(4, "0")[:4]
         sk_kcv = compute_kcv(body.sk_hex, body.algorithm)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {
         "arpc_hex": arpc,
-        "arc_hex": body.arc_hex.upper(),
+        "arc_hex": arc4,
         "session_key_kcv": sk_kcv,
         "algorithm": body.algorithm,
-        # F55 sub-element 91 = Issuer Authentication Data = ARPC || ARC (10 bytes total)
-        "f55_tlv_hex": f"910A{arpc}{body.arc_hex.upper().ljust(4, '0')}",
+        # F55 sub-element 91 = Issuer Authentication Data = ARPC || ARC
+        "f55_tlv_hex": _tlv("91", arpc + arc4),
     }
 
 
