@@ -6,6 +6,7 @@ load_dotenv(ROOT_DIR / '.env')
 import os
 import uuid
 import asyncio
+import hmac
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict
@@ -38,7 +39,7 @@ from iso8583 import (
 )
 from samples import SAMPLES
 from tcp_transport import send_over_tcp, LENGTH_HEADERS
-from pin_crypto import encrypt_pin_block, PIN_FORMATS, PIN_ALGORITHMS
+from pin_crypto import encrypt_pin_block, decrypt_pin_block, PIN_FORMATS, PIN_ALGORITHMS
 from key_management import (
     compute_kcv, compute_cvv, compute_pvv,
     derive_icc_mk, compute_arqc,
@@ -269,6 +270,29 @@ class ArqcRequest(BaseModel):
     cdol_hex: str
     cvn: str = "CVN10"            # CVN10 | CVN18 | AES
     atc_hex: Optional[str] = None  # required for CVN18 / AES
+
+
+class CvvVerifyRequest(CvvRequest):
+    cvv: str
+
+
+class PvvVerifyRequest(BaseModel):
+    """Verify a PIN against a PVV. Give either the clear `pin`, or an encrypted
+    `pin_block_hex` with the PEK that protects it (as received in F52)."""
+    pan: str
+    pvv: str
+    pvki: str = "1"
+    pvk_a_hex: str
+    pvk_b_hex: str
+    pin: Optional[str] = None
+    pin_block_hex: Optional[str] = None
+    pek_hex: Optional[str] = None
+    pin_format: str = "ISO-0"
+    pin_algorithm: str = "3DES"
+
+
+class ArqcVerifyRequest(ArqcRequest):
+    arqc_hex: str
 
 
 class ArpcRequest(BaseModel):
@@ -988,50 +1012,115 @@ async def keys_pvv(body: PvvRequest, _user=Depends(get_current_user)):
     return {"pvv": pvv, "pvki": body.pvki, "pvk_kcv": kcv}
 
 
-@api.post("/keys/arqc")
-async def keys_arqc(body: ArqcRequest, _user=Depends(get_current_user)):
-    try:
-        if body.cvn == "AES":
-            icc_mk = derive_icc_mk_aes(body.mdk_hex, body.pan, body.psn)
-            sk = derive_session_key_aes(icc_mk, body.atc_hex or "0000")
-            arqc = compute_arqc_aes(sk, body.cdol_hex)
-            mdk_kcv = compute_kcv(body.mdk_hex, "AES")
-            icc_kcv = compute_kcv(icc_mk, "AES")
-            sk_kcv = compute_kcv(sk, "AES")
-            algo = "AES"
+def _compute_arqc(body: ArqcRequest) -> dict:
+    """Shared by /keys/arqc and /keys/arqc/verify. Raises ValueError on bad input."""
+    if body.cvn == "AES":
+        icc_mk = derive_icc_mk_aes(body.mdk_hex, body.pan, body.psn)
+        sk = derive_session_key_aes(icc_mk, body.atc_hex or "0000")
+        arqc = compute_arqc_aes(sk, body.cdol_hex)
+        algo = "AES"
+    else:
+        if body.cvn == "CVN18":
+            # Visa CVN18: ICC MK Option B, EMV common session key, EMV (0x80) padding.
+            if not body.atc_hex:
+                raise ValueError("ATC is required for CVN18 derivation.")
+            icc_mk = derive_icc_mk(body.mdk_hex, body.pan, body.psn, option="B")
+            sk = derive_session_key_cvn18(icc_mk, body.atc_hex)
+            padding = "EMV"
+        elif body.cvn == "CVN10":
+            # Visa CVN10: ICC MK Option A, no session key, Visa (zero) padding.
+            icc_mk = derive_icc_mk(body.mdk_hex, body.pan, body.psn, option="A")
+            sk = icc_mk
+            padding = "VISA"
         else:
-            if body.cvn == "CVN18":
-                # Visa CVN18: ICC MK Option B, EMV common session key, EMV (0x80) padding.
-                if not body.atc_hex:
-                    raise ValueError("ATC is required for CVN18 derivation.")
-                icc_mk = derive_icc_mk(body.mdk_hex, body.pan, body.psn, option="B")
-                sk = derive_session_key_cvn18(icc_mk, body.atc_hex)
-                padding = "EMV"
-            elif body.cvn == "CVN10":
-                # Visa CVN10: ICC MK Option A, no session key, Visa (zero) padding.
-                icc_mk = derive_icc_mk(body.mdk_hex, body.pan, body.psn, option="A")
-                sk = icc_mk
-                padding = "VISA"
-            else:
-                raise ValueError("cvn must be CVN10, CVN18 or AES.")
-            arqc = compute_arqc(sk, body.cdol_hex, padding=padding)
-            mdk_kcv = compute_kcv(body.mdk_hex, "3DES")
-            icc_kcv = compute_kcv(icc_mk, "3DES")
-            sk_kcv = compute_kcv(sk, "3DES")
-            algo = "3DES"
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+            raise ValueError("cvn must be CVN10, CVN18 or AES.")
+        arqc = compute_arqc(sk, body.cdol_hex, padding=padding)
+        algo = "3DES"
     return {
         "cvn": body.cvn,
         "algorithm": algo,
         "icc_mk_hex": icc_mk,
         "session_key_hex": sk,
         "arqc_hex": arqc,
-        "mdk_kcv": mdk_kcv,
-        "icc_mk_kcv": icc_kcv,
-        "session_key_kcv": sk_kcv,
-        # Pre-built BER-TLV bytes for F55 (tag 9F26 = ARQC, length 08)
-        "f55_tlv_hex": _tlv("9F26", arqc),
+        "mdk_kcv": compute_kcv(body.mdk_hex, algo),
+        "icc_mk_kcv": compute_kcv(icc_mk, algo),
+        "session_key_kcv": compute_kcv(sk, algo),
+    }
+
+
+def _same(a: str, b: str) -> bool:
+    """Constant-time, case-insensitive comparison of two codes."""
+    return hmac.compare_digest((a or "").replace(" ", "").upper().encode(),
+                               (b or "").replace(" ", "").upper().encode())
+
+
+@api.post("/keys/arqc")
+async def keys_arqc(body: ArqcRequest, _user=Depends(get_current_user)):
+    try:
+        res = _compute_arqc(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # Pre-built BER-TLV bytes for F55 (tag 9F26 = ARQC, length 08)
+    res["f55_tlv_hex"] = _tlv("9F26", res["arqc_hex"])
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Verification (issuer side). Each returns {"valid": bool, ...}; the expected
+# value is never returned, as with an HSM verify command.
+# ---------------------------------------------------------------------------
+@api.post("/keys/cvv/verify")
+async def keys_cvv_verify(body: CvvVerifyRequest, _user=Depends(get_current_user)):
+    try:
+        if not (body.cvv.isdigit() and len(body.cvv) == 3):
+            raise ValueError("CVV must be 3 digits.")
+        expected = compute_cvv(body.pan, body.expiry, body.service_code, body.cvk_a_hex, body.cvk_b_hex)
+        kcv = compute_kcv(body.cvk_a_hex + body.cvk_b_hex, "3DES")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"valid": _same(expected, body.cvv), "service_code": body.service_code, "cvk_kcv": kcv}
+
+
+@api.post("/keys/pvv/verify")
+async def keys_pvv_verify(body: PvvVerifyRequest, _user=Depends(get_current_user)):
+    try:
+        if not (body.pvv.isdigit() and len(body.pvv) == 4):
+            raise ValueError("PVV must be 4 digits.")
+        if body.pin_block_hex:
+            if body.pin:
+                raise ValueError("Give either pin or pin_block_hex, not both.")
+            if not body.pek_hex:
+                raise ValueError("pek_hex is required with pin_block_hex.")
+            pin = decrypt_pin_block(body.pin_block_hex, body.pan, body.pek_hex,
+                                    body.pin_format, body.pin_algorithm)
+            source = "pin_block"
+        elif body.pin:
+            pin, source = body.pin, "clear"
+        else:
+            raise ValueError("Give pin or pin_block_hex.")
+        expected = compute_pvv(body.pan, pin, body.pvki, body.pvk_a_hex, body.pvk_b_hex)
+        kcv = compute_kcv(body.pvk_a_hex + body.pvk_b_hex, "3DES")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"valid": _same(expected, body.pvv), "pvki": body.pvki, "pin_source": source, "pvk_kcv": kcv}
+
+
+@api.post("/keys/arqc/verify")
+async def keys_arqc_verify(body: ArqcVerifyRequest, _user=Depends(get_current_user)):
+    try:
+        res = _compute_arqc(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    valid = _same(res["arqc_hex"], body.arqc_hex)
+    return {
+        "valid": valid,
+        "cvn": res["cvn"],
+        "algorithm": res["algorithm"],
+        "mdk_kcv": res["mdk_kcv"],
+        "icc_mk_kcv": res["icc_mk_kcv"],
+        "session_key_kcv": res["session_key_kcv"],
+        # Needed by the issuer to build the ARPC once the ARQC is accepted.
+        "session_key_hex": res["session_key_hex"] if valid else None,
     }
 
 

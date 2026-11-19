@@ -263,3 +263,137 @@ def test_arpc_method2_rejects_bad_input(kw, msg):
     with pytest.raises(HTTPException) as e:
         _endpoint_arpc(**args)
     assert e.value.status_code == 400 and msg in e.value.detail
+
+
+# ---------------------------------------------------------------------------
+# PIN block decryption (pin_crypto) vs psec
+# ---------------------------------------------------------------------------
+import pin_crypto  # noqa: E402
+from psec import pinblock as psec_pb  # noqa: E402
+
+
+@pytest.mark.parametrize("fmt", ["ISO-0", "ISO-3"])
+def test_clear_pin_block_decode_matches_psec(fmt):
+    enc = psec_pb.encode_pinblock_iso_0 if fmt == "ISO-0" else psec_pb.encode_pinblock_iso_3
+    for _ in range(N):
+        pan, pin = _digits(16), _digits(RNG.randint(4, 12))
+        assert pin_crypto.decode_clear_pin_block(enc(pin, pan).hex(), pan, fmt) == pin
+
+
+@pytest.mark.parametrize("fmt", ["ISO-0", "ISO-1", "ISO-3"])
+@pytest.mark.parametrize("algo,key_len", [("3DES", 16), ("3DES", 24), ("AES", 16)])
+def test_pin_block_encrypt_decrypt_roundtrip(fmt, algo, key_len):
+    for _ in range(50):
+        pan, pin, key = _digits(16), _digits(RNG.randint(4, 12)), _rand(key_len).hex()
+        _, enc = pin_crypto.encrypt_pin_block(pin, pan, key, fmt, algo)
+        assert pin_crypto.decrypt_pin_block(enc, pan, key, fmt, algo) == pin
+
+
+def test_pin_block_wrong_key_or_pan_is_rejected():
+    pan, key = "4111111111111111", "0123456789ABCDEFFEDCBA9876543210"
+    _, enc = pin_crypto.encrypt_pin_block("1234", pan, key, "ISO-0", "3DES")
+    with pytest.raises(ValueError):
+        pin_crypto.decrypt_pin_block(enc, pan, "FEDCBA9876543210" + "0123456789ABCDEF", "ISO-0", "3DES")
+    with pytest.raises(ValueError):
+        pin_crypto.decrypt_pin_block(enc, "5500000000000004", key, "ISO-0", "3DES")
+
+
+# ---------------------------------------------------------------------------
+# Verification endpoints
+# ---------------------------------------------------------------------------
+def _call(handler, model, **kw):
+    import asyncio
+    server = _server()
+    return asyncio.run(getattr(server, handler)(getattr(server, model)(**kw), None))
+
+
+def _wrong_digit(s):
+    i = RNG.randrange(len(s))
+    return s[:i] + str((int(s[i]) + RNG.randint(1, 9)) % 10) + s[i + 1:]
+
+
+def test_cvv_verify_endpoint():
+    for _ in range(N // 2):
+        a, b = _rand(8), _rand(8)
+        pan, exp, svc = _pan(), f"{RNG.randint(0, 99):02d}{RNG.randint(1, 12):02d}", RNG.choice(["101", "000", "999"])
+        good = psec.cvv.generate_cvv(a + b, pan, exp, svc)
+        args = dict(pan=pan, expiry=exp, service_code=svc, cvk_a_hex=a.hex(), cvk_b_hex=b.hex())
+        assert _call("keys_cvv_verify", "CvvVerifyRequest", cvv=good, **args)["valid"] is True
+        assert _call("keys_cvv_verify", "CvvVerifyRequest", cvv=_wrong_digit(good), **args)["valid"] is False
+
+
+def test_pvv_verify_endpoint_clear_pin():
+    for _ in range(N // 2):
+        a, b = _rand(8), _rand(8)
+        pan, pin, pvki = _pan(), _digits(4), str(RNG.randint(0, 9))
+        pvv = psec.pin.generate_visa_pvv(a + b, pvki, pin, pan)
+        args = dict(pan=pan, pvki=pvki, pvv=pvv, pvk_a_hex=a.hex(), pvk_b_hex=b.hex())
+        r = _call("keys_pvv_verify", "PvvVerifyRequest", pin=pin, **args)
+        assert r["valid"] is True and r["pin_source"] == "clear"
+        assert _call("keys_pvv_verify", "PvvVerifyRequest", pin=_wrong_digit(pin), **args)["valid"] is False
+
+
+@pytest.mark.parametrize("fmt", ["ISO-0", "ISO-3"])
+def test_pvv_verify_endpoint_pin_block(fmt):
+    """PIN block built and encrypted independently with psec, then verified by the endpoint."""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms as alg, modes
+    enc = psec_pb.encode_pinblock_iso_0 if fmt == "ISO-0" else psec_pb.encode_pinblock_iso_3
+    for _ in range(N // 4):
+        a, b, pek = _rand(8), _rand(8), _rand(16)
+        pan, pin, pvki = _digits(16), _digits(4), "1"
+        clear = enc(pin, pan)
+        block = Cipher(alg.TripleDES(pek + pek[:8]), modes.ECB()).encryptor().update(clear).hex()
+        pvv = psec.pin.generate_visa_pvv(a + b, pvki, pin, pan)
+        args = dict(pan=pan, pvki=pvki, pvk_a_hex=a.hex(), pvk_b_hex=b.hex(),
+                    pin_block_hex=block, pek_hex=pek.hex(), pin_format=fmt)
+        r = _call("keys_pvv_verify", "PvvVerifyRequest", pvv=pvv, **args)
+        assert r["valid"] is True and r["pin_source"] == "pin_block"
+        assert _call("keys_pvv_verify", "PvvVerifyRequest", pvv=_wrong_digit(pvv), **args)["valid"] is False
+
+
+def test_arqc_verify_endpoint_cvn10_and_cvn18():
+    for _ in range(N // 4):
+        mdk, pan, psn, atc = _rand(16), _pan(), _psn(), _rand(2)
+        tags = _emv_tags(atc)
+        cvr, iad = _rand(4), _rand(32)
+        cases = [
+            ("CVN10", cvn.VisaCVN10(mdk, _rand(16), _rand(16), pan, psn).generate_ac(**tags, cvr=cvr),
+             b"".join(tags.values()) + cvr, None),
+            ("CVN18", cvn.VisaCVN18(mdk, _rand(16), _rand(16), pan, psn).generate_ac(**tags, tag_9f10=iad),
+             b"".join(tags.values()) + iad, atc.hex()),
+        ]
+        for name, arqc, data, atc_hex in cases:
+            args = dict(mdk_hex=mdk.hex(), pan=pan, psn=psn, cdol_hex=data.hex(), cvn=name, atc_hex=atc_hex)
+            ok = _call("keys_arqc_verify", "ArqcVerifyRequest", arqc_hex=arqc.hex(), **args)
+            assert ok["valid"] is True and ok["session_key_hex"], name
+            bad = bytes([arqc[0] ^ 0x01]) + arqc[1:]
+            ko = _call("keys_arqc_verify", "ArqcVerifyRequest", arqc_hex=bad.hex(), **args)
+            assert ko["valid"] is False and ko["session_key_hex"] is None, name
+
+
+def test_verify_endpoints_never_return_expected_value():
+    r = _call("keys_cvv_verify", "CvvVerifyRequest", pan="4123456789012345", expiry="8701",
+              service_code="101", cvk_a_hex=CVK_A, cvk_b_hex=CVK_B, cvv="000")
+    assert r["valid"] is False and "561" not in str(r)
+
+
+@pytest.mark.parametrize("handler,model,kw,msg", [
+    ("keys_cvv_verify", "CvvVerifyRequest", dict(pan="4123456789012345", expiry="8701", service_code="101",
+                                                 cvk_a_hex=CVK_A, cvk_b_hex=CVK_B, cvv="56"), "3 digits"),
+    ("keys_pvv_verify", "PvvVerifyRequest", dict(pan="4111111111111111", pvv="123", pvk_a_hex=CVK_A,
+                                                 pvk_b_hex=CVK_B, pin="1234"), "4 digits"),
+    ("keys_pvv_verify", "PvvVerifyRequest", dict(pan="4111111111111111", pvv="1234", pvk_a_hex=CVK_A,
+                                                 pvk_b_hex=CVK_B), "Give pin or pin_block_hex"),
+    ("keys_pvv_verify", "PvvVerifyRequest", dict(pan="4111111111111111", pvv="1234", pvk_a_hex=CVK_A,
+                                                 pvk_b_hex=CVK_B, pin_block_hex="00" * 8), "pek_hex is required"),
+    ("keys_pvv_verify", "PvvVerifyRequest", dict(pan="4111111111111111", pvv="1234", pvk_a_hex=CVK_A,
+                                                 pvk_b_hex=CVK_B, pin="1234", pin_block_hex="00" * 8,
+                                                 pek_hex=CVK_A + CVK_B), "not both"),
+    ("keys_arqc_verify", "ArqcVerifyRequest", dict(mdk_hex=CVK_A + CVK_B, pan="4111111111111111",
+                                                   cdol_hex="00", cvn="CVN18", arqc_hex="00" * 8), "ATC is required"),
+])
+def test_verify_endpoints_reject_bad_input(handler, model, kw, msg):
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as e:
+        _call(handler, model, **kw)
+    assert e.value.status_code == 400 and msg in e.value.detail
