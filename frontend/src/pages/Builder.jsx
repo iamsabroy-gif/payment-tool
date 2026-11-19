@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams, Link } from "react-router-dom";
 import { api, apiErr } from "../lib/api";
+import { CryptoChecks, KeysetSelect } from "../components/CryptoChecks";
 import { toast } from "sonner";
 import { FloppyDisk, PaperPlaneTilt, ArrowsClockwise, CheckCircle, XCircle, LockKey, Key } from "@phosphor-icons/react";
 import PinHelperModal from "../components/PinHelperModal";
@@ -33,6 +34,7 @@ export default function Builder() {
     const [saveName, setSaveName] = useState("");
     const [result, setResult] = useState(null);
     const [target, setTarget] = useState("simulator"); // 'simulator' | connection id
+    const [keysetId, setKeysetId] = useState(""); // simulator only: verify cryptograms
     const [connections, setConnections] = useState([]);
     const [connStatuses, setConnStatuses] = useState({}); // {id: {state}}
     const [pinHelperOpen, setPinHelperOpen] = useState(false);
@@ -190,6 +192,7 @@ export default function Builder() {
                     mti,
                     network_id: networkId,
                     data_elements: buildDeMap(),
+                    keyset_id: keysetId || null,
                 });
                 data = resp.data;
             } else {
@@ -390,9 +393,12 @@ export default function Builder() {
                         </div>
                     )}
                     {target === "simulator" && (
-                        <div className="mt-2 text-[11px] text-[#4B5563]">
-                            In-process mock host — safe for dev / exploration.
-                        </div>
+                        <>
+                            <div className="mt-2 text-[11px] text-[#4B5563]">
+                                In-process mock host — safe for dev / exploration.
+                            </div>
+                            <KeysetSelect value={keysetId} onChange={setKeysetId} />
+                        </>
                     )}
                 </div>
                 <form onSubmit={doSave} className="bg-white p-4 col-span-12 md:col-span-4 flex gap-2 items-end">
@@ -542,6 +548,12 @@ export default function Builder() {
                             <pre className="font-mono text-[11px] break-all whitespace-pre-wrap">{result.inbound.raw_hex}</pre>
                         </div>
                     </div>
+                    {result.inbound?.parsed?.crypto_checks && (
+                        <div className="px-5 py-3 border-t border-[#E5E7EB]">
+                            <div className="text-[10px] uppercase tracking-widest text-[#4B5563] mb-2">Issuer checks</div>
+                            <CryptoChecks checks={result.inbound.parsed.crypto_checks} />
+                        </div>
+                    )}
                     <div className="px-5 py-3 border-t border-[#E5E7EB] text-[11px]">
                         <button
                             onClick={() => navigate(`/app/logs?open=${result.outbound.id}`)}

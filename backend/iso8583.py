@@ -12,7 +12,7 @@ auth code "512904"). The wire bytes are encoded according to the spec, and on de
 converted back to ASCII for display in the Log Viewer.
 """
 from __future__ import annotations
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 import random
 
 from iso8583_codecs import (
@@ -772,13 +772,29 @@ RESPONSE_CODES = {
     "55": "Incorrect PIN",
     "57": "Transaction not permitted to cardholder",
     "61": "Exceeds withdrawal limit",
+    "81": "PIN cryptographic error",
+    "82": "Negative CAM, dCVV, iCVV or CVV results",
     "91": "Issuer unavailable",
     "96": "System malfunction",
 }
 
 
-def simulate_response(request_mti: str, data_elements: Dict[str, str], network_id: str = "visa") -> Tuple[str, Dict]:
-    """Generate a response message in the same network's wire format."""
+def simulate_response(
+    request_mti: str,
+    data_elements: Dict[str, str],
+    network_id: str = "visa",
+    keyset: Optional[Dict] = None,
+) -> Tuple[str, Dict]:
+    """Generate a response message in the same network's wire format.
+
+    With `keyset` (a key set from the user's key vault), the simulator first acts
+    as the issuer and verifies the ARQC (F55), track 2 CVV (F35) and PIN (F52)
+    -- see sim_crypto.py. A failed check sets the response code; a verified
+    ARQC is answered with an ARPC in F55 tag 91.
+    """
+    from sim_crypto import run_issuer_checks, build_arpc_tlv
+
+    crypto = run_issuer_checks(request_mti, data_elements, keyset) if keyset else None
     last_two = request_mti[-2:]
     response_mti = request_mti[:2] + (f"{int(last_two) + 10:02d}" if last_two.isdigit() else "10")
 
@@ -791,6 +807,8 @@ def simulate_response(request_mti: str, data_elements: Dict[str, str], network_i
 
     if request_mti.startswith("08"):
         rc = "00"
+    elif crypto and crypto["rc"]:
+        rc = crypto["rc"]
     elif not pan or len(pan) < 12:
         rc = "14"
     elif amount_minor <= 0:
@@ -817,9 +835,13 @@ def simulate_response(request_mti: str, data_elements: Dict[str, str], network_i
         "49": str(data_elements.get("49", "")),
         "70": str(data_elements.get("70", "")) if request_mti.startswith("08") else None,
     }
+    if crypto and crypto["arpc_ctx"]:
+        response_de["55"] = build_arpc_tlv(crypto["arpc_ctx"], rc)
     response_de = {k: v for k, v in response_de.items() if v}
 
     response_hex, response_meta = encode_message(response_mti, response_de, network_id)
+    if crypto is not None:
+        response_meta["crypto_checks"] = crypto["checks"]
     response_meta["response_code"] = rc
     response_meta["response_code_description"] = RESPONSE_CODES.get(rc, "Unknown")
     response_meta["authorization_code"] = auth_code.strip()

@@ -191,6 +191,7 @@ class SendTransactionRequest(BaseModel):
     network_id: str = "visa"
     data_elements: Dict[str, str]
     endpoint_url: Optional[str] = None
+    keyset_id: Optional[str] = None   # simulator only: verify cryptograms with this key set
 
 
 class CheckoutRequest(BaseModel):
@@ -316,6 +317,7 @@ class BucketRunRequest(BaseModel):
     template_ids: Optional[List[str]] = None  # only used by /buckets/run-once
     target: str = "simulator"                 # "simulator" | <connection_profile_id>
     delay_ms: int = Field(default=0, ge=0, le=10_000)
+    keyset_id: Optional[str] = None           # simulator only: verify cryptograms with this key set
 
 
 class UserSpecCreate(BaseModel):
@@ -706,6 +708,18 @@ async def delete_template(template_id: str, user=Depends(get_current_user)):
     return {"ok": True}
 
 
+async def _load_keyset(user: dict, keyset_id: Optional[str], target: Optional[str] = None) -> Optional[dict]:
+    """Fetch one of the caller's own key sets for simulator verification."""
+    if not keyset_id:
+        return None
+    if target not in (None, "", "simulator"):
+        raise HTTPException(status_code=400, detail="keyset_id is only used with the simulator.")
+    doc = await db.user_keys.find_one({"id": keyset_id, "user_id": user["id"]}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Key set not found")
+    return doc
+
+
 # ---------------------------------------------------------------------------
 # Internal: execute a single template against a target (simulator or connection)
 # ---------------------------------------------------------------------------
@@ -719,6 +733,7 @@ async def _execute_message(
     bucket_run_id: Optional[str] = None,
     template_id: Optional[str] = None,
     template_name: Optional[str] = None,
+    keyset: Optional[dict] = None,       # simulator only
 ) -> Dict:
     """Encode + send + persist outbound/inbound logs.
 
@@ -744,7 +759,7 @@ async def _execute_message(
             "endpoint_url": "internal://simulator",
             "bucket_run_id": bucket_run_id, "template_id": template_id, "template_name": template_name,
         }
-        resp_hex, resp_meta = simulate_response(mti, data_elements, network_id)
+        resp_hex, resp_meta = simulate_response(mti, data_elements, network_id, keyset)
         rc = resp_meta.get("response_code", "00")
         inbound_id = str(uuid.uuid4())
         inbound_log = {
@@ -865,6 +880,7 @@ async def validate_only(body: SendTransactionRequest, user=Depends(get_current_u
 
 @api.post("/iso/send")
 async def send_transaction(body: SendTransactionRequest, user=Depends(get_current_user)):
+    keyset = await _load_keyset(user, body.keyset_id, "endpoint" if body.endpoint_url else None)
     await enforce_log_quota(user)
     await _ensure_user_spec_loaded(body.network_id, user)
     try:
@@ -908,7 +924,7 @@ async def send_transaction(body: SendTransactionRequest, user=Depends(get_curren
             resp_hex = ""
             resp_meta = {"error": str(e)}
     else:
-        resp_hex, resp_meta = simulate_response(body.mti, body.data_elements, body.network_id)
+        resp_hex, resp_meta = simulate_response(body.mti, body.data_elements, body.network_id, keyset)
         rc = resp_meta.get("response_code", "00")
 
     inbound_id = str(uuid.uuid4())
@@ -1778,6 +1794,7 @@ async def delete_bucket(bucket_id: str, user=Depends(get_current_user)):
 
 async def _run_template_ids(
     *, user: dict, template_ids: List[str], target: str, delay_ms: int, bucket_run_id: str,
+    keyset: Optional[dict] = None,
 ) -> List[Dict]:
     """Sequentially execute templates and return per-step result rows."""
     results: List[Dict] = []
@@ -1792,6 +1809,7 @@ async def _run_template_ids(
                 user=user, mti=tpl["mti"], network_id=tpl["network_id"],
                 data_elements=tpl["data_elements"], target=target,
                 bucket_run_id=bucket_run_id, template_id=tid, template_name=tpl["name"],
+                keyset=keyset,
             )
             results.append({
                 "step": idx + 1, "template_id": tid, "template_name": tpl["name"],
@@ -1801,6 +1819,8 @@ async def _run_template_ids(
                 "outbound_log_id": r["outbound"]["id"],
                 "inbound_log_id": r["inbound"]["id"],
                 "error": r.get("error"),
+                "crypto_checks": (r["inbound"].get("parsed") or {}).get("crypto_checks")
+                if isinstance(r["inbound"].get("parsed"), dict) else None,
             })
         except HTTPException as he:
             results.append({"step": idx + 1, "template_id": tid, "template_name": tpl["name"],
@@ -1824,9 +1844,10 @@ async def run_bucket(bucket_id: str, body: BucketRunRequest, user=Depends(get_cu
         raise HTTPException(status_code=404, detail="Bucket not found")
     bucket_run_id = str(uuid.uuid4())
     started = now_iso()
+    keyset = await _load_keyset(user, body.keyset_id, body.target)
     results = await _run_template_ids(
         user=user, template_ids=bucket["template_ids"],
-        target=body.target, delay_ms=body.delay_ms, bucket_run_id=bucket_run_id,
+        target=body.target, delay_ms=body.delay_ms, bucket_run_id=bucket_run_id, keyset=keyset,
     )
     finished = now_iso()
     await db.buckets.update_one(
@@ -1860,9 +1881,10 @@ async def run_bucket_once(body: BucketRunRequest, user=Depends(get_current_user)
         raise HTTPException(status_code=400, detail="One or more templates not found")
     bucket_run_id = str(uuid.uuid4())
     started = now_iso()
+    keyset = await _load_keyset(user, body.keyset_id, body.target)
     results = await _run_template_ids(
         user=user, template_ids=body.template_ids,
-        target=body.target, delay_ms=body.delay_ms, bucket_run_id=bucket_run_id,
+        target=body.target, delay_ms=body.delay_ms, bucket_run_id=bucket_run_id, keyset=keyset,
     )
     finished = now_iso()
     return {
