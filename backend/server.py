@@ -43,7 +43,7 @@ from key_management import (
     compute_kcv, compute_cvv, compute_pvv,
     derive_icc_mk, compute_arqc,
     derive_session_key_cvn18, derive_icc_mk_aes, derive_session_key_aes, compute_arqc_aes,
-    compute_arpc,
+    compute_arpc, compute_arpc_method2,
 )
 from session_manager import (
     connect_session,
@@ -274,8 +274,11 @@ class ArqcRequest(BaseModel):
 class ArpcRequest(BaseModel):
     sk_hex: str
     arqc_hex: str
-    arc_hex: str = "3030"     # ASCII "00" by default = approved
+    arc_hex: str = "3030"     # ASCII "00" by default = approved (Method 1)
     algorithm: str = "3DES"
+    method: int = 1           # 1 = ARQC XOR ARC (CVN10, M/Chip); 2 = MAC over ARQC||CSU||PAD (CVN18)
+    csu_hex: Optional[str] = None   # Method 2: 4-byte Card Status Update
+    pad_hex: Optional[str] = None   # Method 2: 0-8 byte Proprietary Authentication Data
 
 
 class BucketCreate(BaseModel):
@@ -1043,18 +1046,34 @@ def _tlv(tag: str, value_hex: str) -> str:
 @api.post("/keys/arpc")
 async def keys_arpc(body: ArpcRequest, _user=Depends(get_current_user)):
     try:
-        arpc = compute_arpc(body.sk_hex, body.arqc_hex, body.arc_hex, body.algorithm)
-        arc4 = body.arc_hex.replace(" ", "").upper().ljust(4, "0")[:4]
+        if body.method == 1:
+            arpc = compute_arpc(body.sk_hex, body.arqc_hex, body.arc_hex, body.algorithm)
+            arc4 = body.arc_hex.replace(" ", "").upper().ljust(4, "0")[:4]
+            iad = arpc + arc4
+        elif body.method == 2:
+            if body.algorithm != "3DES":
+                raise ValueError("ARPC Method 2 is only supported with 3DES.")
+            if not body.csu_hex:
+                raise ValueError("CSU is required for ARPC Method 2.")
+            arpc = compute_arpc_method2(body.sk_hex, body.arqc_hex, body.csu_hex, body.pad_hex or "")
+            arc4 = None
+            iad = arpc + body.csu_hex.replace(" ", "").upper() + (body.pad_hex or "").replace(" ", "").upper()
+        else:
+            raise ValueError("method must be 1 or 2.")
         sk_kcv = compute_kcv(body.sk_hex, body.algorithm)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {
+        "method": body.method,
         "arpc_hex": arpc,
         "arc_hex": arc4,
+        "csu_hex": body.csu_hex.replace(" ", "").upper() if body.method == 2 else None,
+        "pad_hex": (body.pad_hex or "").replace(" ", "").upper() if body.method == 2 else None,
         "session_key_kcv": sk_kcv,
         "algorithm": body.algorithm,
-        # F55 sub-element 91 = Issuer Authentication Data = ARPC || ARC
-        "f55_tlv_hex": _tlv("91", arpc + arc4),
+        # F55 tag 91 = Issuer Authentication Data:
+        #   Method 1: ARPC(8) || ARC(2)    Method 2: ARPC(4) || CSU(4) || PAD(0-8)
+        "f55_tlv_hex": _tlv("91", iad),
     }
 
 

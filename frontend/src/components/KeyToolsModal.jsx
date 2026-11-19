@@ -309,15 +309,18 @@ function ArpcTab({ onInsertField, onClose }) {
     const [arqc, setArqc] = useState("");
     const [arc, setArc] = useState("3030");
     const [algo, setAlgo] = useState("3DES");
+    const [method, setMethod] = useState(1);
+    const [csu, setCsu] = useState("00000000");
+    const [pad, setPad] = useState("");
     const [res, setRes] = useState(null);
     const [busy, setBusy] = useState(false);
 
     const compute = async () => {
         setBusy(true);
         try {
-            const { data } = await api.post("/keys/arpc", {
-                sk_hex: sk, arqc_hex: arqc, arc_hex: arc, algorithm: algo,
-            });
+            const { data } = await api.post("/keys/arpc", method === 2
+                ? { sk_hex: sk, arqc_hex: arqc, algorithm: "3DES", method: 2, csu_hex: csu, pad_hex: pad }
+                : { sk_hex: sk, arqc_hex: arqc, arc_hex: arc, algorithm: algo, method: 1 });
             setRes(data);
         } catch (e) { toast.error(apiErr(e)); }
         finally { setBusy(false); }
@@ -326,20 +329,26 @@ function ArpcTab({ onInsertField, onClose }) {
     const insertF55 = () => {
         if (!res) return;
         onInsertField?.(55, res.f55_tlv_hex);
-        toast.success("F55 populated with 91 IAD (ARPC || ARC)");
+        toast.success(method === 2 ? "F55 populated with 91 IAD (ARPC || CSU)" : "F55 populated with 91 IAD (ARPC || ARC)");
         onClose?.();
     };
 
     return (
         <>
             <p className="text-xs text-[#4B5563]">
-                Issuer ARPC (Method 1): <code className="font-mono">encrypt(SK, ARQC XOR (ARC || 00…))</code>.
-                Paste the session key (SK_AC) — usually derived from MDK on the issuer side — plus the ARQC the
-                terminal sent and a 2-byte authorisation response code (ARC). 3030 = ASCII "00" = approved.
+                Method 1 (Visa CVN10, M/Chip): <code className="font-mono">encrypt(SK, ARQC XOR (ARC || 00…))</code>, tag 91 = ARPC || ARC.
+                Method 2 (Visa CVN18): <code className="font-mono">MAC(SK, ARQC || CSU || PAD)</code>, 4 bytes, tag 91 = ARPC || CSU || PAD.
+                Paste the session key (SK_AC); the ARQC tab shows it for CVN18.
             </p>
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-4 gap-3">
+                <Field label="Method">
+                    <select data-testid="arpc-method-select" value={method} onChange={(e) => { const m = Number(e.target.value); setMethod(m); if (m === 2) setAlgo("3DES"); }} className="w-full h-9 border border-gray-300 px-2 text-sm bg-white">
+                        <option value={1}>Method 1</option>
+                        <option value={2}>Method 2</option>
+                    </select>
+                </Field>
                 <Field label="Algorithm">
-                    <select data-testid="arpc-algo-select" value={algo} onChange={(e) => setAlgo(e.target.value)} className="w-full h-9 border border-gray-300 px-2 text-sm bg-white">
+                    <select data-testid="arpc-algo-select" value={algo} disabled={method === 2} onChange={(e) => setAlgo(e.target.value)} className="w-full h-9 border border-gray-300 px-2 text-sm bg-white disabled:bg-gray-100">
                         <option value="3DES">3DES</option>
                         <option value="AES">AES</option>
                     </select>
@@ -354,17 +363,29 @@ function ArpcTab({ onInsertField, onClose }) {
                 <Field label="ARQC (8 bytes hex for 3DES)">
                     <input data-testid="arpc-arqc" value={arqc} onChange={(e) => setArqc(e.target.value.toUpperCase())} placeholder="e.g. 1A2B3C4D5E6F7081" className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
                 </Field>
-                <Field label="ARC (2 bytes hex; '3030' = '00' approved)">
-                    <input data-testid="arpc-arc" value={arc} maxLength={4} onChange={(e) => setArc(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
-                </Field>
+                {method === 1 ? (
+                    <Field label="ARC (2 bytes hex; '3030' = '00' approved)">
+                        <input data-testid="arpc-arc" value={arc} maxLength={4} onChange={(e) => setArc(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
+                    </Field>
+                ) : (
+                    <Field label="CSU (4 bytes hex, Card Status Update)">
+                        <input data-testid="arpc-csu" value={csu} maxLength={8} onChange={(e) => setCsu(e.target.value.toUpperCase().replace(/[^0-9A-F]/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
+                    </Field>
+                )}
             </div>
+            {method === 2 && (
+                <Field label="Proprietary Auth Data (optional, 0-8 bytes hex)">
+                    <input data-testid="arpc-pad" value={pad} maxLength={16} onChange={(e) => setPad(e.target.value.toUpperCase().replace(/[^0-9A-F]/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
+                </Field>
+            )}
             <button onClick={compute} disabled={busy || !arqc} data-testid="arpc-compute-btn" className="h-9 px-4 border border-[#002FA7] text-[#002FA7] text-xs font-semibold hover:bg-[#F3F4F6] disabled:opacity-50">
                 {busy ? "Computing…" : "Compute ARPC"}
             </button>
             {res && (
                 <div className="border border-[#E5E7EB] bg-[#F9FAFB] p-3 space-y-2 text-xs" data-testid="arpc-result">
                     <ResultLine label="ARPC"        value={res.arpc_hex}        accent testid="arpc-value" />
-                    <ResultLine label="ARC"         value={res.arc_hex}                testid="arpc-arc-out" />
+                    {res.arc_hex && <ResultLine label="ARC" value={res.arc_hex} testid="arpc-arc-out" />}
+                    {res.csu_hex && <ResultLine label="CSU" value={res.csu_hex} testid="arpc-csu-out" />}
                     <ResultLine label="SK KCV"      value={res.session_key_kcv}        testid="arpc-sk-kcv" />
                     <ResultLine label="F55 TLV"     value={res.f55_tlv_hex}            testid="arpc-f55-tlv" />
                     <button onClick={insertF55} data-testid="arpc-insert-f55" className="h-9 px-4 bg-[#002FA7] text-white text-xs font-semibold hover:bg-[#002080] flex items-center gap-2">

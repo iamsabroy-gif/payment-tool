@@ -319,3 +319,26 @@ def compute_arpc(sk_hex: str, arqc_hex: str, arc_hex: str, algorithm: str = "3DE
         return _ecb_aes(sk, block)[:8].hex().upper()
     else:
         raise ValueError("algorithm must be 3DES or AES")
+
+
+# ---------------------------------------------------------------------------
+# ARPC Method 2 — Visa CVN18/CVN22, EMV CSK-based profiles (EMV Book 2, 8.2.2)
+# ---------------------------------------------------------------------------
+def compute_arpc_method2(sk_hex: str, arqc_hex: str, csu_hex: str, pad_hex: str = "") -> str:
+    """ARPC Method 2: leftmost 4 bytes of the ISO/IEC 9797-1 alg 3 MAC (EMV padding)
+    over ARQC(8) || CSU(4) || Proprietary Authentication Data(0-8), under SK_AC.
+
+    Tag 91 (Issuer Authentication Data) is then ARPC || CSU || PAD.
+    3DES only.
+    """
+    arqc = bytes.fromhex((arqc_hex or "").replace(" ", ""))
+    csu = bytes.fromhex((csu_hex or "").replace(" ", ""))
+    pad = bytes.fromhex((pad_hex or "").replace(" ", ""))
+    if len(arqc) != 8:
+        raise ValueError("ARQC must be 8 bytes (16 hex chars).")
+    if len(csu) != 4:
+        raise ValueError("CSU must be 4 bytes (8 hex chars).")
+    if len(pad) > 8:
+        raise ValueError("Proprietary Authentication Data must be 0-8 bytes.")
+    mac = compute_arqc(sk_hex, (arqc + csu + pad).hex(), padding="EMV")
+    return mac[:8]

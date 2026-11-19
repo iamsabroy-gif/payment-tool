@@ -206,3 +206,60 @@ def test_arpc_tag91_length_is_consistent(algo, key_len):
     assert declared * 2 == len(tlv) - 4          # length byte matches the value
     assert 8 <= declared <= 16                   # EMV limit for tag 91
     assert tlv.endswith("3030")
+
+
+# ---------------------------------------------------------------------------
+# ARPC Method 2 (Visa CVN18)
+# ---------------------------------------------------------------------------
+def test_vector_arpc_method2_pyemv_doc():
+    assert km.compute_arpc_method2("AAAAAAAAAAAAAAAABBBBBBBBBBBBBBBB", "1234567890ABCDEF", "00000000") \
+        == "9308BEBC"
+
+
+def test_arpc_method2_matches_pyemv():
+    for _ in range(N):
+        sk, arqc, csu = _rand(16), _rand(8), _rand(4)
+        pad = _rand(RNG.randint(0, 8))
+        assert km.compute_arpc_method2(sk.hex(), arqc.hex(), csu.hex(), pad.hex()) \
+            == ac.generate_arpc_2(sk, arqc, csu, pad).hex().upper(), len(pad)
+
+
+def _endpoint_arpc(**kw):
+    import asyncio
+    server = _server()
+    return asyncio.run(server.keys_arpc(server.ArpcRequest(**kw), None))
+
+
+def test_visa_cvn18_arqc_then_arpc2_end_to_end():
+    """Issuer flow: ARQC endpoint gives the session key, ARPC endpoint answers with Method 2."""
+    for _ in range(N // 4):
+        mdk, pan, psn, atc = _rand(16), _pan(), _psn(), _rand(2)
+        tags, iad = _emv_tags(atc), _rand(32)
+        csu, pad = _rand(4), _rand(RNG.randint(0, 8))
+        card = cvn.VisaCVN18(mdk, _rand(16), _rand(16), pan, psn)
+        ref_arqc = card.generate_ac(**tags, tag_9f10=iad)
+        ref_arpc = card.generate_arpc(ref_arqc, atc, csu, pad).hex().upper()
+
+        q = _endpoint_arqc(mdk_hex=mdk.hex(), pan=pan, psn=psn, cvn="CVN18", atc_hex=atc.hex(),
+                           cdol_hex=(b"".join(tags.values()) + iad).hex())
+        r = _endpoint_arpc(sk_hex=q["session_key_hex"], arqc_hex=q["arqc_hex"], method=2,
+                           csu_hex=csu.hex(), pad_hex=pad.hex())
+        assert r["arpc_hex"] == ref_arpc
+        value = ref_arpc + csu.hex().upper() + pad.hex().upper()
+        assert r["f55_tlv_hex"] == f"91{len(value) // 2:02X}{value}"
+        assert 8 <= len(value) // 2 <= 16
+
+
+@pytest.mark.parametrize("kw,msg", [
+    (dict(csu_hex=None), "CSU is required"),
+    (dict(csu_hex="0000"), "CSU must be 4 bytes"),
+    (dict(csu_hex="00000000", pad_hex="00" * 9), "0-8 bytes"),
+    (dict(csu_hex="00000000", algorithm="AES"), "only supported with 3DES"),
+    (dict(csu_hex="00000000", method=3), "method must be 1 or 2"),
+])
+def test_arpc_method2_rejects_bad_input(kw, msg):
+    from fastapi import HTTPException
+    args = dict(sk_hex="0123456789ABCDEFFEDCBA9876543210", arqc_hex="1234567890ABCDEF", method=2) | kw
+    with pytest.raises(HTTPException) as e:
+        _endpoint_arpc(**args)
+    assert e.value.status_code == 400 and msg in e.value.detail
