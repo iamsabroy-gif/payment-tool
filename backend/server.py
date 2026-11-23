@@ -18,10 +18,22 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 
-from emergentintegrations.payments.stripe.checkout import (
-    StripeCheckout,
-    CheckoutSessionRequest,
-)
+try:  # Emergent-hosted only; billing is disabled where this package is unavailable.
+    from emergentintegrations.payments.stripe.checkout import (
+        StripeCheckout as _StripeCheckout,
+        CheckoutSessionRequest,
+    )
+except ImportError:  # pragma: no cover - depends on the hosting platform
+    _StripeCheckout = None
+    CheckoutSessionRequest = None
+
+
+def StripeCheckout(*, api_key: Optional[str] = None, webhook_url: str):
+    """Stripe client, or 503 when billing isn't available on this deployment."""
+    key = api_key or os.environ.get("STRIPE_API_KEY")
+    if _StripeCheckout is None or not key:
+        raise HTTPException(status_code=503, detail="Billing is not configured on this deployment.")
+    return _StripeCheckout(api_key=key, webhook_url=webhook_url)
 
 from iso8583 import (
     NETWORK_SPECS,
@@ -2248,9 +2260,7 @@ async def billing_checkout(body: CheckoutRequest, request: Request, user=Depends
 
     host_url = str(request.base_url).rstrip("/")
     webhook_url = f"{host_url}/api/webhook/stripe"
-    api_key = os.environ["STRIPE_API_KEY"]
-
-    stripe = StripeCheckout(api_key=api_key, webhook_url=webhook_url)
+    stripe = StripeCheckout(webhook_url=webhook_url)
     origin = body.origin_url.rstrip("/")
     success_url = f"{origin}/billing/return?session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url = f"{origin}/app/pricing"
@@ -2294,7 +2304,7 @@ async def billing_status(session_id: str, request: Request, user=Depends(get_cur
 
     host_url = str(request.base_url).rstrip("/")
     webhook_url = f"{host_url}/api/webhook/stripe"
-    stripe = StripeCheckout(api_key=os.environ["STRIPE_API_KEY"], webhook_url=webhook_url)
+    stripe = StripeCheckout(webhook_url=webhook_url)
 
     try:
         status = await stripe.get_checkout_status(session_id)
@@ -2342,7 +2352,7 @@ async def stripe_webhook(request: Request):
     sig = request.headers.get("Stripe-Signature", "")
     host_url = str(request.base_url).rstrip("/")
     webhook_url = f"{host_url}/api/webhook/stripe"
-    stripe = StripeCheckout(api_key=os.environ["STRIPE_API_KEY"], webhook_url=webhook_url)
+    stripe = StripeCheckout(webhook_url=webhook_url)
     try:
         evt = await stripe.handle_webhook(body, sig)
     except Exception as e:
@@ -2439,3 +2449,25 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Single-service deployment: serve the built React app from the same origin.
+# Enabled when FRONTEND_BUILD_DIR points at a CRA build (set in the Dockerfile).
+# Same origin means first-party auth cookies and no CORS between UI and API.
+# ---------------------------------------------------------------------------
+_FRONTEND_DIR = os.environ.get("FRONTEND_BUILD_DIR")
+if _FRONTEND_DIR and (Path(_FRONTEND_DIR) / "index.html").is_file():
+    from fastapi.responses import FileResponse, JSONResponse
+
+    _frontend_root = Path(_FRONTEND_DIR).resolve()
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_frontend(full_path: str):
+        if full_path == "api" or full_path.startswith("api/"):
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
+        candidate = (_frontend_root / full_path).resolve()
+        # Real file inside the build (JS, CSS, images...) -> serve it; anything else -> SPA shell.
+        if full_path and candidate.is_file() and _frontend_root in candidate.parents:
+            return FileResponse(candidate)
+        return FileResponse(_frontend_root / "index.html", headers={"Cache-Control": "no-cache"})
