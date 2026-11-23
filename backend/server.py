@@ -6,9 +6,10 @@ load_dotenv(ROOT_DIR / '.env')
 import os
 import uuid
 import asyncio
+import hmac
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 
 import bcrypt
 import jwt
@@ -38,12 +39,14 @@ from iso8583 import (
 )
 from samples import SAMPLES
 from tcp_transport import send_over_tcp, LENGTH_HEADERS
-from pin_crypto import encrypt_pin_block, PIN_FORMATS, PIN_ALGORITHMS
+from net_probe import probe_tcp, normalise_host, host_port_from_ws_url
+from pin_crypto import encrypt_pin_block, decrypt_pin_block, PIN_FORMATS, PIN_ALGORITHMS
 from key_management import (
     compute_kcv, compute_cvv, compute_pvv,
     derive_icc_mk, compute_arqc,
     derive_session_key_cvn18, derive_icc_mk_aes, derive_session_key_aes, compute_arqc_aes,
-    compute_arpc,
+    compute_arpc, compute_arpc_method2,
+    derive_ac_keys, compute_ibm3624_offset, compute_ibm3624_pin, DEFAULT_DECIMALIZATION_TABLE,
 )
 from session_manager import (
     connect_session,
@@ -190,6 +193,7 @@ class SendTransactionRequest(BaseModel):
     network_id: str = "visa"
     data_elements: Dict[str, str]
     endpoint_url: Optional[str] = None
+    keyset_id: Optional[str] = None   # simulator only: verify cryptograms with this key set
 
 
 class CheckoutRequest(BaseModel):
@@ -217,6 +221,28 @@ class ConnectionProfileIn(BaseModel):
     heartbeat_interval_sec: int = 30
     wire_format: str = "native"        # "native" | "ascii"
     description: Optional[str] = None
+
+
+class ProbeRequest(BaseModel):
+    """Ad-hoc telnet-style test. `host` may include the port ("10.0.0.5:8583")."""
+    host: str
+    port: Optional[int] = Field(default=None, ge=1, le=65535)
+    use_tls: bool = False
+    timeout_sec: float = Field(default=5.0, gt=0, le=30)
+
+
+def _validated_tcp_target(body: "ConnectionProfileIn") -> Tuple[str, int]:
+    """Normalise host/IP for a TCP profile; a port pasted into the host field fills an empty port."""
+    try:
+        host, pasted = normalise_host(body.host or "")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    port = body.port or pasted
+    if not port:
+        raise HTTPException(status_code=400, detail="TCP profiles require host and port")
+    if pasted and body.port and pasted != body.port:
+        raise HTTPException(status_code=400, detail=f"Host says port {pasted} but the port field says {body.port}.")
+    return host, port
 
 
 class TcpSendRequest(BaseModel):
@@ -267,15 +293,70 @@ class ArqcRequest(BaseModel):
     pan: str
     psn: str = "00"
     cdol_hex: str
-    cvn: str = "CVN10"            # CVN10 | CVN18 | AES
-    atc_hex: Optional[str] = None  # required for CVN18 / AES
+    cvn: str = "CVN10"            # CVN10 | CVN18 | MC_CVN16 | MC_CVN17 | MC_CVN20 | MC_CVN21 | AES
+    atc_hex: Optional[str] = None  # 9F36; required for every CVN except CVN10
+    un_hex: Optional[str] = None   # 9F37; required for MC_CVN16 / MC_CVN17
+
+
+class CvvVerifyRequest(CvvRequest):
+    cvv: str
+
+
+class PvvVerifyRequest(BaseModel):
+    """Verify a PIN against a PVV. Give either the clear `pin`, or an encrypted
+    `pin_block_hex` with the PEK that protects it (as received in F52)."""
+    pan: str
+    pvv: str
+    pvki: str = "1"
+    pvk_a_hex: str
+    pvk_b_hex: str
+    pin: Optional[str] = None
+    pin_block_hex: Optional[str] = None
+    pek_hex: Optional[str] = None
+    pin_format: str = "ISO-0"
+    pin_algorithm: str = "3DES"
+
+
+class Ibm3624Request(BaseModel):
+    """IBM 3624 PIN offset. Validation data = PAN[verify_offset : verify_offset + verify_length],
+    right-padded to 16 hex digits with `pad`."""
+    pan: str
+    pin: str
+    pvk_hex: str                                   # 8, 16 or 24 bytes
+    decimalization_table: str = DEFAULT_DECIMALIZATION_TABLE
+    verify_offset: int = 0
+    verify_length: Optional[int] = None            # default: rest of the PAN, max 16
+    pad: str = "F"
+
+
+class Ibm3624VerifyRequest(BaseModel):
+    """Verify a PIN against an IBM 3624 offset; PIN given clear or as an encrypted PIN block."""
+    pan: str
+    offset: str
+    pvk_hex: str
+    decimalization_table: str = DEFAULT_DECIMALIZATION_TABLE
+    verify_offset: int = 0
+    verify_length: Optional[int] = None
+    pad: str = "F"
+    pin: Optional[str] = None
+    pin_block_hex: Optional[str] = None
+    pek_hex: Optional[str] = None
+    pin_format: str = "ISO-0"
+    pin_algorithm: str = "3DES"
+
+
+class ArqcVerifyRequest(ArqcRequest):
+    arqc_hex: str
 
 
 class ArpcRequest(BaseModel):
     sk_hex: str
     arqc_hex: str
-    arc_hex: str = "3030"     # ASCII "00" by default = approved
+    arc_hex: str = "3030"     # ASCII "00" by default = approved (Method 1)
     algorithm: str = "3DES"
+    method: int = 1           # 1 = ARQC XOR ARC (CVN10, M/Chip); 2 = MAC over ARQC||CSU||PAD (CVN18)
+    csu_hex: Optional[str] = None   # Method 2: 4-byte Card Status Update
+    pad_hex: Optional[str] = None   # Method 2: 0-8 byte Proprietary Authentication Data
 
 
 class BucketCreate(BaseModel):
@@ -289,6 +370,7 @@ class BucketRunRequest(BaseModel):
     template_ids: Optional[List[str]] = None  # only used by /buckets/run-once
     target: str = "simulator"                 # "simulator" | <connection_profile_id>
     delay_ms: int = Field(default=0, ge=0, le=10_000)
+    keyset_id: Optional[str] = None           # simulator only: verify cryptograms with this key set
 
 
 class UserSpecCreate(BaseModel):
@@ -679,6 +761,18 @@ async def delete_template(template_id: str, user=Depends(get_current_user)):
     return {"ok": True}
 
 
+async def _load_keyset(user: dict, keyset_id: Optional[str], target: Optional[str] = None) -> Optional[dict]:
+    """Fetch one of the caller's own key sets for simulator verification."""
+    if not keyset_id:
+        return None
+    if target not in (None, "", "simulator"):
+        raise HTTPException(status_code=400, detail="keyset_id is only used with the simulator.")
+    doc = await db.user_keys.find_one({"id": keyset_id, "user_id": user["id"]}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Key set not found")
+    return doc
+
+
 # ---------------------------------------------------------------------------
 # Internal: execute a single template against a target (simulator or connection)
 # ---------------------------------------------------------------------------
@@ -692,6 +786,7 @@ async def _execute_message(
     bucket_run_id: Optional[str] = None,
     template_id: Optional[str] = None,
     template_name: Optional[str] = None,
+    keyset: Optional[dict] = None,       # simulator only
 ) -> Dict:
     """Encode + send + persist outbound/inbound logs.
 
@@ -717,7 +812,7 @@ async def _execute_message(
             "endpoint_url": "internal://simulator",
             "bucket_run_id": bucket_run_id, "template_id": template_id, "template_name": template_name,
         }
-        resp_hex, resp_meta = simulate_response(mti, data_elements, network_id)
+        resp_hex, resp_meta = simulate_response(mti, data_elements, network_id, keyset)
         rc = resp_meta.get("response_code", "00")
         inbound_id = str(uuid.uuid4())
         inbound_log = {
@@ -838,6 +933,7 @@ async def validate_only(body: SendTransactionRequest, user=Depends(get_current_u
 
 @api.post("/iso/send")
 async def send_transaction(body: SendTransactionRequest, user=Depends(get_current_user)):
+    keyset = await _load_keyset(user, body.keyset_id, "endpoint" if body.endpoint_url else None)
     await enforce_log_quota(user)
     await _ensure_user_spec_loaded(body.network_id, user)
     try:
@@ -881,7 +977,7 @@ async def send_transaction(body: SendTransactionRequest, user=Depends(get_curren
             resp_hex = ""
             resp_meta = {"error": str(e)}
     else:
-        resp_hex, resp_meta = simulate_response(body.mti, body.data_elements, body.network_id)
+        resp_hex, resp_meta = simulate_response(body.mti, body.data_elements, body.network_id, keyset)
         rc = resp_meta.get("response_code", "00")
 
     inbound_id = str(uuid.uuid4())
@@ -985,60 +1081,189 @@ async def keys_pvv(body: PvvRequest, _user=Depends(get_current_user)):
     return {"pvv": pvv, "pvki": body.pvki, "pvk_kcv": kcv}
 
 
-@api.post("/keys/arqc")
-async def keys_arqc(body: ArqcRequest, _user=Depends(get_current_user)):
-    try:
-        if body.cvn == "AES":
-            icc_mk = derive_icc_mk_aes(body.mdk_hex, body.pan, body.psn)
-            sk = derive_session_key_aes(icc_mk, body.atc_hex or "0000")
-            arqc = compute_arqc_aes(sk, body.cdol_hex)
-            mdk_kcv = compute_kcv(body.mdk_hex, "AES")
-            icc_kcv = compute_kcv(icc_mk, "AES")
-            sk_kcv = compute_kcv(sk, "AES")
-            algo = "AES"
-        else:
-            icc_mk = derive_icc_mk(body.mdk_hex, body.pan, body.psn)
-            if body.cvn == "CVN18":
-                if not body.atc_hex:
-                    raise ValueError("ATC is required for CVN18 derivation.")
-                sk = derive_session_key_cvn18(icc_mk, body.atc_hex)
-            else:  # CVN10 or default — SK = ICC MK
-                sk = icc_mk
-            arqc = compute_arqc(sk, body.cdol_hex)
-            mdk_kcv = compute_kcv(body.mdk_hex, "3DES")
-            icc_kcv = compute_kcv(icc_mk, "3DES")
-            sk_kcv = compute_kcv(sk, "3DES")
-            algo = "3DES"
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+def _compute_arqc(body: ArqcRequest) -> dict:
+    """Shared by /keys/arqc and /keys/arqc/verify. Raises ValueError on bad input."""
+    keys: dict = {}
+    if body.cvn == "AES":
+        icc_mk = derive_icc_mk_aes(body.mdk_hex, body.pan, body.psn)
+        sk = derive_session_key_aes(icc_mk, body.atc_hex or "0000")
+        arqc = compute_arqc_aes(sk, body.cdol_hex)
+        algo = "AES"
+    else:
+        keys = derive_ac_keys(body.cvn, body.mdk_hex, body.pan, body.psn, body.atc_hex, body.un_hex)
+        icc_mk, sk = keys["icc_mk"], keys["sk"]
+        arqc = compute_arqc(sk, body.cdol_hex, padding=keys["padding"])
+        algo = "3DES"
     return {
         "cvn": body.cvn,
         "algorithm": algo,
         "icc_mk_hex": icc_mk,
         "session_key_hex": sk,
         "arqc_hex": arqc,
-        "mdk_kcv": mdk_kcv,
-        "icc_mk_kcv": icc_kcv,
-        "session_key_kcv": sk_kcv,
-        # Pre-built BER-TLV bytes for F55 (tag 9F26 = ARQC, length 08)
-        "f55_tlv_hex": f"9F2608{arqc}",
+        "mdk_kcv": compute_kcv(body.mdk_hex, algo),
+        "icc_mk_kcv": compute_kcv(icc_mk, algo),
+        "session_key_kcv": compute_kcv(sk, algo),
+        # Key and method the issuer uses to answer with an ARPC (POST /keys/arpc).
+        "arpc_key_hex": keys["arpc_key"] if algo == "3DES" else sk,
+        "arpc_method": keys["arpc_method"] if algo == "3DES" else 1,
     }
+
+
+def _same(a: str, b: str) -> bool:
+    """Constant-time, case-insensitive comparison of two codes."""
+    return hmac.compare_digest((a or "").replace(" ", "").upper().encode(),
+                               (b or "").replace(" ", "").upper().encode())
+
+
+@api.post("/keys/arqc")
+async def keys_arqc(body: ArqcRequest, _user=Depends(get_current_user)):
+    try:
+        res = _compute_arqc(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # Pre-built BER-TLV bytes for F55 (tag 9F26 = ARQC, length 08)
+    res["f55_tlv_hex"] = _tlv("9F26", res["arqc_hex"])
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Verification (issuer side). Each returns {"valid": bool, ...}; the expected
+# value is never returned, as with an HSM verify command.
+# ---------------------------------------------------------------------------
+@api.post("/keys/cvv/verify")
+async def keys_cvv_verify(body: CvvVerifyRequest, _user=Depends(get_current_user)):
+    try:
+        if not (body.cvv.isdigit() and len(body.cvv) == 3):
+            raise ValueError("CVV must be 3 digits.")
+        expected = compute_cvv(body.pan, body.expiry, body.service_code, body.cvk_a_hex, body.cvk_b_hex)
+        kcv = compute_kcv(body.cvk_a_hex + body.cvk_b_hex, "3DES")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"valid": _same(expected, body.cvv), "service_code": body.service_code, "cvk_kcv": kcv}
+
+
+@api.post("/keys/pvv/verify")
+async def keys_pvv_verify(body: PvvVerifyRequest, _user=Depends(get_current_user)):
+    try:
+        if not (body.pvv.isdigit() and len(body.pvv) == 4):
+            raise ValueError("PVV must be 4 digits.")
+        if body.pin_block_hex:
+            if body.pin:
+                raise ValueError("Give either pin or pin_block_hex, not both.")
+            if not body.pek_hex:
+                raise ValueError("pek_hex is required with pin_block_hex.")
+            pin = decrypt_pin_block(body.pin_block_hex, body.pan, body.pek_hex,
+                                    body.pin_format, body.pin_algorithm)
+            source = "pin_block"
+        elif body.pin:
+            pin, source = body.pin, "clear"
+        else:
+            raise ValueError("Give pin or pin_block_hex.")
+        expected = compute_pvv(body.pan, pin, body.pvki, body.pvk_a_hex, body.pvk_b_hex)
+        kcv = compute_kcv(body.pvk_a_hex + body.pvk_b_hex, "3DES")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"valid": _same(expected, body.pvv), "pvki": body.pvki, "pin_source": source, "pvk_kcv": kcv}
+
+
+def _ibm3624_args(body) -> dict:
+    return dict(table=body.decimalization_table, verify_offset=body.verify_offset,
+                verify_length=body.verify_length, pad=body.pad)
+
+
+@api.post("/keys/ibm3624")
+async def keys_ibm3624(body: Ibm3624Request, _user=Depends(get_current_user)):
+    try:
+        offset = compute_ibm3624_offset(body.pvk_hex, body.pin, body.pan, **_ibm3624_args(body))
+        kcv = compute_kcv(body.pvk_hex, "3DES")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"offset": offset, "pvk_kcv": kcv}
+
+
+@api.post("/keys/ibm3624/verify")
+async def keys_ibm3624_verify(body: Ibm3624VerifyRequest, _user=Depends(get_current_user)):
+    try:
+        if body.pin_block_hex:
+            if body.pin:
+                raise ValueError("Give either pin or pin_block_hex, not both.")
+            if not body.pek_hex:
+                raise ValueError("pek_hex is required with pin_block_hex.")
+            pin = decrypt_pin_block(body.pin_block_hex, body.pan, body.pek_hex,
+                                    body.pin_format, body.pin_algorithm)
+            source = "pin_block"
+        elif body.pin:
+            pin, source = body.pin, "clear"
+        else:
+            raise ValueError("Give pin or pin_block_hex.")
+        expected = compute_ibm3624_pin(body.pvk_hex, body.offset, body.pan, **_ibm3624_args(body))
+        kcv = compute_kcv(body.pvk_hex, "3DES")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # PIN length must equal offset length; compare in constant time.
+    return {"valid": len(pin) == len(expected) and _same(expected, pin), "pin_source": source, "pvk_kcv": kcv}
+
+
+@api.post("/keys/arqc/verify")
+async def keys_arqc_verify(body: ArqcVerifyRequest, _user=Depends(get_current_user)):
+    try:
+        res = _compute_arqc(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    valid = _same(res["arqc_hex"], body.arqc_hex)
+    return {
+        "valid": valid,
+        "cvn": res["cvn"],
+        "algorithm": res["algorithm"],
+        "mdk_kcv": res["mdk_kcv"],
+        "icc_mk_kcv": res["icc_mk_kcv"],
+        "session_key_kcv": res["session_key_kcv"],
+        # Needed by the issuer to build the ARPC once the ARQC is accepted.
+        "session_key_hex": res["session_key_hex"] if valid else None,
+        "arpc_key_hex": res["arpc_key_hex"] if valid else None,
+        "arpc_method": res["arpc_method"],
+    }
+
+
+def _tlv(tag: str, value_hex: str) -> str:
+    """Encode a short BER-TLV (value < 128 bytes)."""
+    n = len(value_hex) // 2
+    if n > 127:
+        raise ValueError("TLV value too long for short-form length.")
+    return f"{tag}{n:02X}{value_hex}"
 
 
 @api.post("/keys/arpc")
 async def keys_arpc(body: ArpcRequest, _user=Depends(get_current_user)):
     try:
-        arpc = compute_arpc(body.sk_hex, body.arqc_hex, body.arc_hex, body.algorithm)
+        if body.method == 1:
+            arpc = compute_arpc(body.sk_hex, body.arqc_hex, body.arc_hex, body.algorithm)
+            arc4 = body.arc_hex.replace(" ", "").upper().ljust(4, "0")[:4]
+            iad = arpc + arc4
+        elif body.method == 2:
+            if body.algorithm != "3DES":
+                raise ValueError("ARPC Method 2 is only supported with 3DES.")
+            if not body.csu_hex:
+                raise ValueError("CSU is required for ARPC Method 2.")
+            arpc = compute_arpc_method2(body.sk_hex, body.arqc_hex, body.csu_hex, body.pad_hex or "")
+            arc4 = None
+            iad = arpc + body.csu_hex.replace(" ", "").upper() + (body.pad_hex or "").replace(" ", "").upper()
+        else:
+            raise ValueError("method must be 1 or 2.")
         sk_kcv = compute_kcv(body.sk_hex, body.algorithm)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {
+        "method": body.method,
         "arpc_hex": arpc,
-        "arc_hex": body.arc_hex.upper(),
+        "arc_hex": arc4,
+        "csu_hex": body.csu_hex.replace(" ", "").upper() if body.method == 2 else None,
+        "pad_hex": (body.pad_hex or "").replace(" ", "").upper() if body.method == 2 else None,
         "session_key_kcv": sk_kcv,
         "algorithm": body.algorithm,
-        # F55 sub-element 91 = Issuer Authentication Data = ARPC || ARC (10 bytes total)
-        "f55_tlv_hex": f"910A{arpc}{body.arc_hex.upper().ljust(4, '0')}",
+        # F55 tag 91 = Issuer Authentication Data:
+        #   Method 1: ARPC(8) || ARC(2)    Method 2: ARPC(4) || CSU(4) || PAD(0-8)
+        "f55_tlv_hex": _tlv("91", iad),
     }
 
 
@@ -1186,8 +1411,8 @@ async def create_connection(body: ConnectionProfileIn, user=Depends(get_current_
         raise HTTPException(status_code=400, detail=f"length_header must be one of {LENGTH_HEADERS}")
     if body.transport not in ("tcp", "websocket"):
         raise HTTPException(status_code=400, detail="transport must be 'tcp' or 'websocket'")
-    if body.transport == "tcp" and not (body.host and body.port):
-        raise HTTPException(status_code=400, detail="TCP profiles require host and port")
+    if body.transport == "tcp":
+        body.host, body.port = _validated_tcp_target(body)
     if body.transport == "websocket" and not body.ws_url:
         raise HTTPException(status_code=400, detail="WebSocket profiles require ws_url")
     if body.length_header not in LENGTH_HEADERS:
@@ -1225,6 +1450,8 @@ async def create_connection(body: ConnectionProfileIn, user=Depends(get_current_
 async def update_connection(conn_id: str, body: ConnectionProfileIn, user=Depends(get_current_user)):
     if body.length_header not in LENGTH_HEADERS:
         raise HTTPException(status_code=400, detail=f"length_header must be one of {LENGTH_HEADERS}")
+    if body.transport == "tcp":
+        body.host, body.port = _validated_tcp_target(body)
     update = {
         "name": body.name,
         "transport": body.transport,
@@ -1265,6 +1492,38 @@ async def delete_connection(conn_id: str, user=Depends(get_current_user)):
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Connection profile not found")
     return {"ok": True}
+
+
+@api.post("/connections/probe")
+async def connection_probe_adhoc(body: ProbeRequest, _user=Depends(get_current_user)):
+    """Telnet-style reachability test for any host:port, before saving a profile.
+    Sends no data; reports DNS, TCP, optional TLS and any greeting."""
+    try:
+        host, pasted = normalise_host(body.host)
+        port = body.port or pasted
+        if not port:
+            raise ValueError("Port is required.")
+        return await probe_tcp(host, port, body.use_tls, body.timeout_sec)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@api.post("/connections/{conn_id}/probe")
+async def connection_probe(conn_id: str, user=Depends(get_current_user)):
+    """Telnet-style reachability test for a saved profile (TCP host:port, or the
+    host:port underneath a ws:// / wss:// URL). Does not touch the live session."""
+    profile = await db.connection_profiles.find_one({"id": conn_id, "user_id": user["id"]}, {"_id": 0})
+    if not profile:
+        raise HTTPException(status_code=404, detail="Connection profile not found")
+    timeout = min(float(profile.get("timeout_sec") or 5.0), 30.0)
+    try:
+        if profile.get("transport") == "websocket":
+            host, port, tls = host_port_from_ws_url(profile.get("ws_url", ""))
+        else:
+            host, port, tls = profile.get("host", ""), int(profile.get("port") or 0), bool(profile.get("use_tls"))
+        return await probe_tcp(host, port, tls, timeout)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @api.post("/connections/{conn_id}/connect")
@@ -1654,6 +1913,7 @@ async def delete_bucket(bucket_id: str, user=Depends(get_current_user)):
 
 async def _run_template_ids(
     *, user: dict, template_ids: List[str], target: str, delay_ms: int, bucket_run_id: str,
+    keyset: Optional[dict] = None,
 ) -> List[Dict]:
     """Sequentially execute templates and return per-step result rows."""
     results: List[Dict] = []
@@ -1668,6 +1928,7 @@ async def _run_template_ids(
                 user=user, mti=tpl["mti"], network_id=tpl["network_id"],
                 data_elements=tpl["data_elements"], target=target,
                 bucket_run_id=bucket_run_id, template_id=tid, template_name=tpl["name"],
+                keyset=keyset,
             )
             results.append({
                 "step": idx + 1, "template_id": tid, "template_name": tpl["name"],
@@ -1677,6 +1938,8 @@ async def _run_template_ids(
                 "outbound_log_id": r["outbound"]["id"],
                 "inbound_log_id": r["inbound"]["id"],
                 "error": r.get("error"),
+                "crypto_checks": (r["inbound"].get("parsed") or {}).get("crypto_checks")
+                if isinstance(r["inbound"].get("parsed"), dict) else None,
             })
         except HTTPException as he:
             results.append({"step": idx + 1, "template_id": tid, "template_name": tpl["name"],
@@ -1700,9 +1963,10 @@ async def run_bucket(bucket_id: str, body: BucketRunRequest, user=Depends(get_cu
         raise HTTPException(status_code=404, detail="Bucket not found")
     bucket_run_id = str(uuid.uuid4())
     started = now_iso()
+    keyset = await _load_keyset(user, body.keyset_id, body.target)
     results = await _run_template_ids(
         user=user, template_ids=bucket["template_ids"],
-        target=body.target, delay_ms=body.delay_ms, bucket_run_id=bucket_run_id,
+        target=body.target, delay_ms=body.delay_ms, bucket_run_id=bucket_run_id, keyset=keyset,
     )
     finished = now_iso()
     await db.buckets.update_one(
@@ -1736,9 +2000,10 @@ async def run_bucket_once(body: BucketRunRequest, user=Depends(get_current_user)
         raise HTTPException(status_code=400, detail="One or more templates not found")
     bucket_run_id = str(uuid.uuid4())
     started = now_iso()
+    keyset = await _load_keyset(user, body.keyset_id, body.target)
     results = await _run_template_ids(
         user=user, template_ids=body.template_ids,
-        target=body.target, delay_ms=body.delay_ms, bucket_run_id=bucket_run_id,
+        target=body.target, delay_ms=body.delay_ms, bucket_run_id=bucket_run_id, keyset=keyset,
     )
     finished = now_iso()
     return {

@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { Link } from "react-router-dom";
 import { api, apiErr } from "../lib/api";
+import { CryptoChecks, KeysetSelect } from "../components/CryptoChecks";
 import { toast } from "sonner";
 import {
     Stack, Trash, PencilSimple, Play, X, FloppyDisk, CheckCircle, XCircle,
@@ -145,6 +146,7 @@ export default function Buckets() {
 // ----------------------------------------------------------------------
 export function RunBucketModal({ bucket, onClose, onComplete, oneShot = false, templateIds = [] }) {
     const [target, setTarget] = useState("simulator");
+    const [keysetId, setKeysetId] = useState("");
     const [delay, setDelay] = useState(0);
     const [conns, setConns] = useState([]);
     const [running, setRunning] = useState(false);
@@ -157,9 +159,10 @@ export function RunBucketModal({ bucket, onClose, onComplete, oneShot = false, t
         setRunning(true);
         try {
             const url = oneShot ? "/buckets/run-once" : `/buckets/${bucket.id}/run`;
+            const keyset_id = target === "simulator" && keysetId ? keysetId : null;
             const body = oneShot
-                ? { template_ids: templateIds, target, delay_ms: Number(delay) }
-                : { target, delay_ms: Number(delay) };
+                ? { template_ids: templateIds, target, delay_ms: Number(delay), keyset_id }
+                : { target, delay_ms: Number(delay), keyset_id };
             const { data } = await api.post(url, body);
             toast.success(`Bucket finished: ${data.succeeded}/${data.total} approved`);
             onComplete?.(data);
@@ -207,6 +210,9 @@ export function RunBucketModal({ bucket, onClose, onComplete, oneShot = false, t
                             </div>
                         )}
                     </label>
+                    {target === "simulator" && (
+                        <KeysetSelect value={keysetId} onChange={setKeysetId} testid="bucket-run-keyset-select" />
+                    )}
                     <label className="block">
                         <div className="text-[10px] uppercase tracking-widest text-[#4B5563] mb-1">Delay between sends</div>
                         <select
@@ -284,8 +290,13 @@ export function RunResultsModal({ results, onClose }) {
                                             <span className={`px-1.5 py-0.5 border ${r.status_code === "00" ? "border-[#16A34A] text-[#16A34A]" : "border-[#E11D48] text-[#E11D48]"}`}>{r.status_code}</span>
                                         ) : <span className="text-[#9CA3AF]">—</span>}
                                     </td>
-                                    <td className="py-2 px-4 text-[#4B5563] truncate max-w-md">
-                                        {r.error || r.response_description || "ok"}
+                                    <td className="py-2 px-4 text-[#4B5563] max-w-md">
+                                        <div className="truncate">{r.error || r.response_description || "ok"}</div>
+                                        {r.crypto_checks && r.crypto_checks.length > 0 && (
+                                            <div className="mt-1 font-sans">
+                                                <CryptoChecks checks={r.crypto_checks} testid={`bucket-results-checks-${r.step}`} />
+                                            </div>
+                                        )}
                                     </td>
                                 </tr>
                             ))}

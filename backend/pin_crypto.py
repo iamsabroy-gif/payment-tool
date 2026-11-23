@@ -138,3 +138,60 @@ def encrypt_pin_block(
 
     enc = cipher.encryptor().update(clear_bytes)
     return clear_hex, enc.hex().upper()
+
+
+# ---------------------------------------------------------------------------
+# Decryption (issuer side) — used for PIN / PVV verification
+# ---------------------------------------------------------------------------
+def decode_clear_pin_block(clear_hex: str, pan: str, fmt: str = "ISO-0") -> str:
+    """Recover the PIN from a 16-hex clear PIN block, checking its structure."""
+    if fmt not in PIN_FORMATS:
+        raise ValueError(f"format must be one of {PIN_FORMATS}")
+    block = (clear_hex or "").strip().replace(" ", "").upper()
+    if len(block) != 16:
+        raise ValueError("Clear PIN block must be 8 bytes (16 hex chars).")
+    if fmt in ("ISO-0", "ISO-3"):
+        block = _xor_hex(block, _pan_nibble(pan))
+    expected_ctrl = {"ISO-0": "0", "ISO-1": "1", "ISO-3": "3"}[fmt]
+    if block[0] != expected_ctrl:
+        raise ValueError(f"PIN block control nibble is {block[0]}, expected {expected_ctrl} for {fmt} "
+                         "(wrong key, PAN or format?).")
+    length = int(block[1], 16)
+    if not 4 <= length <= 12:
+        raise ValueError(f"PIN length nibble {length} is outside 4-12 (wrong key, PAN or format?).")
+    pin = block[2:2 + length]
+    if not pin.isdigit():
+        raise ValueError("PIN digits are not decimal (wrong key, PAN or format?).")
+    filler = block[2 + length:]
+    if fmt == "ISO-0" and set(filler) - {"F"}:
+        raise ValueError("ISO-0 filler is not all F (wrong key, PAN or format?).")
+    if fmt == "ISO-3" and set(filler) - set("ABCDEF"):
+        raise ValueError("ISO-3 filler is not A-F (wrong key, PAN or format?).")
+    return pin
+
+
+def decrypt_pin_block(
+    encrypted_hex: str,
+    pan: str,
+    key_hex: str,
+    fmt: str = "ISO-0",
+    algorithm: str = "3DES",
+) -> str:
+    """Decrypt a PIN block produced by encrypt_pin_block and return the PIN.
+
+    AES note: this mirrors encrypt_pin_block's AES mode (an 8-byte ISO-0/1/3 block
+    padded to 16 bytes), not ISO 9564 format 4.
+    """
+    if algorithm not in PIN_ALGORITHMS:
+        raise ValueError(f"algorithm must be one of {PIN_ALGORITHMS}")
+    data = bytes.fromhex((encrypted_hex or "").strip().replace(" ", ""))
+    if algorithm == "3DES":
+        if len(data) != 8:
+            raise ValueError("3DES PIN block must be 8 bytes (16 hex chars).")
+        cipher = Cipher(algorithms.TripleDES(_normalise_3des_key(key_hex)), modes.ECB(), backend=default_backend())
+    else:
+        if len(data) != 16:
+            raise ValueError("AES PIN block must be 16 bytes (32 hex chars).")
+        cipher = Cipher(algorithms.AES(_normalise_aes_key(key_hex)), modes.ECB(), backend=default_backend())
+    clear = cipher.decryptor().update(data)[:8]
+    return decode_clear_pin_block(clear.hex().upper(), pan, fmt)

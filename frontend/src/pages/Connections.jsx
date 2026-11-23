@@ -13,6 +13,10 @@ import {
     Stop,
     Heartbeat,
     CircleNotch,
+    Pulse,
+    ArrowsLeftRight,
+    CheckCircle,
+    XCircle,
 } from "@phosphor-icons/react";
 
 const LENGTH_HEADERS = [
@@ -57,6 +61,10 @@ export default function Connections() {
     const [form, setForm] = useState(EMPTY);
     const [saving, setSaving] = useState(false);
     const [busyId, setBusyId] = useState(null); // connect/disconnect in flight
+    const [diag, setDiag] = useState({});         // {id: {kind: "probe"|"echo", data}} results per row
+    const [diagBusy, setDiagBusy] = useState(null); // `${id}:probe` | `${id}:echo`
+    const [formProbe, setFormProbe] = useState(null);
+    const [formProbing, setFormProbing] = useState(false);
 
     const pollRef = useRef(null);
 
@@ -91,9 +99,42 @@ export default function Connections() {
         return () => clearInterval(pollRef.current);
     }, [items, refreshStatuses]);
 
-    const openNew = () => { setEditing("new"); setForm(EMPTY); };
-    const openEdit = (c) => { setEditing(c); setForm({ ...EMPTY, ...c }); };
-    const close = () => { setEditing(null); setForm(EMPTY); };
+    const openNew = () => { setEditing("new"); setForm(EMPTY); setFormProbe(null); };
+    const openEdit = (c) => { setEditing(c); setForm({ ...EMPTY, ...c }); setFormProbe(null); };
+    const close = () => { setEditing(null); setForm(EMPTY); setFormProbe(null); };
+
+    // "10.0.0.5:9000" or "[fd00::1]:9000" pasted into Host -> split into host + port.
+    const onHostChange = (value) => {
+        const m = value.trim().match(/^\[(.+)\]:(\d{1,5})$/) || value.trim().match(/^([^:[\]\s]+):(\d{1,5})$/);
+        if (m) setForm({ ...form, host: m[1], port: m[2] });
+        else setForm({ ...form, host: value });
+        setFormProbe(null);
+    };
+
+    // Telnet-style test of the host/port in the form, before saving.
+    const probeForm = async () => {
+        setFormProbing(true);
+        setFormProbe(null);
+        try {
+            const { data } = await api.post("/connections/probe", {
+                host: form.host, port: Number(form.port) || null, use_tls: form.use_tls,
+                timeout_sec: Math.min(Number(form.timeout_sec) || 5, 30),
+            });
+            setFormProbe(data);
+        } catch (e) { toast.error(apiErr(e)); }
+        finally { setFormProbing(false); }
+    };
+
+    // Saved profile: "probe" = telnet test (no data sent), "echo" = 0800 network echo over the session.
+    const runDiag = async (c, kind) => {
+        setDiagBusy(`${c.id}:${kind}`);
+        try {
+            const { data } = await api.post(`/connections/${c.id}/${kind === "probe" ? "probe" : "test"}`);
+            setDiag((prev) => ({ ...prev, [c.id]: { kind, data } }));
+            if (kind === "echo" && data.auto_opened) refreshStatuses([c.id]);
+        } catch (e) { toast.error(apiErr(e)); }
+        finally { setDiagBusy(null); }
+    };
 
     const save = async (e) => {
         e.preventDefault();
@@ -252,6 +293,24 @@ export default function Connections() {
                                             Connect
                                         </button>
                                     )}
+                                    <button
+                                        data-testid={`connection-probe-${c.id}`}
+                                        disabled={diagBusy === `${c.id}:probe`}
+                                        onClick={() => runDiag(c, "probe")}
+                                        title="Telnet-style test: open a socket to the host and port, send nothing"
+                                        className="h-9 px-3 border border-gray-300 text-xs hover:bg-gray-50 flex items-center gap-1 disabled:opacity-50"
+                                    >
+                                        {diagBusy === `${c.id}:probe` ? <CircleNotch size={12} className="animate-spin" /> : <Pulse size={12} />} Telnet
+                                    </button>
+                                    <button
+                                        data-testid={`connection-echo-${c.id}`}
+                                        disabled={diagBusy === `${c.id}:echo`}
+                                        onClick={() => runDiag(c, "echo")}
+                                        title="Send a 0800 network echo over the session (connects if needed)"
+                                        className="h-9 px-3 border border-gray-300 text-xs hover:bg-gray-50 flex items-center gap-1 disabled:opacity-50"
+                                    >
+                                        {diagBusy === `${c.id}:echo` ? <CircleNotch size={12} className="animate-spin" /> : <ArrowsLeftRight size={12} />} Echo 0800
+                                    </button>
                                     <button data-testid={`connection-edit-${c.id}`} onClick={() => openEdit(c)} className="h-9 px-3 border border-gray-300 text-xs hover:bg-gray-50 flex items-center gap-1">
                                         <PencilSimple size={12} /> Edit
                                     </button>
@@ -259,6 +318,13 @@ export default function Connections() {
                                         <Trash size={12} />
                                     </button>
                                 </div>
+                                {diag[c.id] && (
+                                    <div className="col-span-12">
+                                        {diag[c.id].kind === "probe"
+                                            ? <ProbeResult data={diag[c.id].data} onClose={() => setDiag((p) => ({ ...p, [c.id]: undefined }))} testid={`connection-probe-result-${c.id}`} />
+                                            : <EchoResult data={diag[c.id].data} onClose={() => setDiag((p) => ({ ...p, [c.id]: undefined }))} testid={`connection-echo-result-${c.id}`} />}
+                                    </div>
+                                )}
                             </article>
                         );
                     })}
@@ -303,11 +369,11 @@ export default function Connections() {
                                     <div className="grid grid-cols-3 gap-3">
                                         <div className="col-span-2">
                                             <Field label="Host (IP or DNS)">
-                                                <input data-testid="connection-host-input" value={form.host} onChange={(e) => setForm({ ...form, host: e.target.value })} placeholder="10.0.12.5" required className="w-full h-9 border border-gray-300 px-2 text-sm font-mono focus:border-[#002FA7]" />
+                                                <input data-testid="connection-host-input" value={form.host} onChange={(e) => onHostChange(e.target.value)} placeholder="10.0.12.5, fd00::5 or cbs.bank.example" required className="w-full h-9 border border-gray-300 px-2 text-sm font-mono focus:border-[#002FA7]" />
                                             </Field>
                                         </div>
                                         <Field label="Port">
-                                            <input data-testid="connection-port-input" type="number" min={1} max={65535} value={form.port} onChange={(e) => setForm({ ...form, port: e.target.value })} required className="w-full h-9 border border-gray-300 px-2 text-sm font-mono focus:border-[#002FA7]" />
+                                            <input data-testid="connection-port-input" type="number" min={1} max={65535} value={form.port} onChange={(e) => { setForm({ ...form, port: e.target.value }); setFormProbe(null); }} required className="w-full h-9 border border-gray-300 px-2 text-sm font-mono focus:border-[#002FA7]" />
                                         </Field>
                                     </div>
                                     <label className="flex flex-col">
@@ -317,6 +383,22 @@ export default function Connections() {
                                             <span className="text-sm">{form.use_tls ? "Encrypted (TLS)" : "Plain TCP"}</span>
                                         </div>
                                     </label>
+                                    <div className="space-y-2">
+                                        <button
+                                            type="button"
+                                            onClick={probeForm}
+                                            disabled={formProbing || !form.host || !form.port}
+                                            data-testid="connection-probe-form-btn"
+                                            className="h-9 px-4 border border-[#002FA7] text-[#002FA7] text-xs font-semibold hover:bg-[#F3F4F6] flex items-center gap-2 disabled:opacity-50"
+                                        >
+                                            {formProbing ? <CircleNotch size={12} className="animate-spin" /> : <Pulse size={12} />}
+                                            Test reachability (telnet)
+                                        </button>
+                                        <div className="text-[10px] text-[#4B5563]">
+                                            Opens a socket to this host and port from the server and closes it; no ISO-8583 data is sent.
+                                        </div>
+                                        {formProbe && <ProbeResult data={formProbe} onClose={() => setFormProbe(null)} testid="connection-probe-form-result" />}
+                                    </div>
                                 </>
                             ) : (
                                 <>
@@ -463,6 +545,67 @@ const Field = ({ label, children }) => (
         {children}
     </label>
 );
+
+const STAGE_LABEL = { dns: "DNS", tcp: "TCP connect", tls: "TLS handshake", banner: "Greeting" };
+
+function ProbeResult({ data, onClose, testid }) {
+    const ok = data.reachable;
+    return (
+        <div className={`border p-3 text-xs space-y-2 ${ok ? "border-[#16A34A] bg-[#F0FDF4]" : "border-[#E11D48] bg-[#FFF1F2]"}`} data-testid={testid}>
+            <div className="flex items-center justify-between">
+                <div className={`flex items-center gap-2 font-semibold ${ok ? "text-[#16A34A]" : "text-[#E11D48]"}`}>
+                    {ok ? <CheckCircle size={14} weight="fill" /> : <XCircle size={14} weight="fill" />}
+                    {ok ? "Reachable" : "Not reachable"} · {data.host}:{data.port}
+                    {data.total_ms != null && <span className="font-normal text-[#4B5563]">· {data.total_ms} ms</span>}
+                </div>
+                {onClose && <button type="button" onClick={onClose} className="text-[#9CA3AF] hover:text-[#111827]">×</button>}
+            </div>
+            <table className="w-full font-mono text-[11px]">
+                <tbody>
+                    {data.stages.map((s) => (
+                        <tr key={s.stage}>
+                            <td className={`w-5 ${s.ok ? "text-[#16A34A]" : "text-[#E11D48]"}`}>{s.ok ? "✓" : "✗"}</td>
+                            <td className="w-28 text-[#111827] font-sans">{STAGE_LABEL[s.stage] || s.stage}</td>
+                            <td className="w-16 text-right pr-3 text-[#4B5563]">{s.ms} ms</td>
+                            <td className="text-[#4B5563] break-all">{s.detail}</td>
+                        </tr>
+                    ))}
+                </tbody>
+            </table>
+            {data.local && <div className="text-[11px] text-[#4B5563]">Source (this server): <span className="font-mono">{data.local}</span></div>}
+            {data.tls?.certificate && !data.tls.certificate.error && (
+                <div className="text-[11px] text-[#4B5563] space-y-0.5">
+                    <div>Certificate: <span className="font-mono">{data.tls.certificate.subject}</span>{data.tls.certificate.self_signed && " (self-signed)"}</div>
+                    <div>Issuer: <span className="font-mono">{data.tls.certificate.issuer}</span></div>
+                    <div>Valid until: <span className="font-mono">{data.tls.certificate.not_after}</span></div>
+                </div>
+            )}
+            {data.banner_text && <div className="text-[11px]">Greeting: <span className="font-mono">{data.banner_text}</span></div>}
+            {data.hint && <div className="text-[11px] text-[#111827]">{data.hint}</div>}
+        </div>
+    );
+}
+
+function EchoResult({ data, onClose, testid }) {
+    const ok = data.ok;
+    return (
+        <div className={`border p-3 text-xs space-y-1 ${ok ? "border-[#16A34A] bg-[#F0FDF4]" : "border-[#E11D48] bg-[#FFF1F2]"}`} data-testid={testid}>
+            <div className="flex items-center justify-between">
+                <div className={`flex items-center gap-2 font-semibold ${ok ? "text-[#16A34A]" : "text-[#E11D48]"}`}>
+                    {ok ? <CheckCircle size={14} weight="fill" /> : <XCircle size={14} weight="fill" />}
+                    0800 echo {ok ? "answered" : `failed at ${data.stage}`}
+                    {data.response_code && <span className="font-normal text-[#4B5563]">· RC {data.response_code} {data.response_description}</span>}
+                </div>
+                {onClose && <button type="button" onClick={onClose} className="text-[#9CA3AF] hover:text-[#111827]">×</button>}
+            </div>
+            {data.request_hex && <div className="font-mono text-[11px] break-all text-[#4B5563]">→ {data.request_hex}</div>}
+            {data.response_hex && <div className="font-mono text-[11px] break-all text-[#4B5563]">← {data.response_hex}</div>}
+            {data.error && <div className="text-[11px] text-[#E11D48]">{data.error}</div>}
+            {data.decode_error && <div className="text-[11px] text-[#E11D48]">Decode: {data.decode_error}</div>}
+            {data.hint && <div className="text-[11px] text-[#111827]">{data.hint}</div>}
+        </div>
+    );
+}
 
 const StatusDot = ({ connected, testid }) => (
     <span

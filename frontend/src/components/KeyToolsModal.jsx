@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { api, apiErr } from "../lib/api";
 import { toast } from "sonner";
-import { Key, X, Copy, ArrowRight, ShieldCheck, Hash } from "@phosphor-icons/react";
+import { Key, X, Copy, ArrowRight, ShieldCheck, Hash, CheckCircle, XCircle } from "@phosphor-icons/react";
 
 const TABS = [
     { id: "kcv",  label: "KCV match" },
@@ -9,6 +9,7 @@ const TABS = [
     { id: "pvv",  label: "PVV (PVK)" },
     { id: "arqc", label: "ARQC (MDK)" },
     { id: "arpc", label: "ARPC (issuer)" },
+    { id: "ibm3624", label: "IBM 3624 offset" },
 ];
 
 export default function KeyToolsModal({ open, onClose, builderState, onInsertField }) {
@@ -26,7 +27,7 @@ export default function KeyToolsModal({ open, onClose, builderState, onInsertFie
                         </div>
                         <h2 className="text-xl font-semibold tracking-tight mt-1">Crypto helpers</h2>
                         <p className="text-[11px] text-[#4B5563] mt-1">
-                            KCV verification, CVV under CVK, PVV under PVK, ARQC under MDK. Software-only — use HSMs in production.
+                            KCV, CVV, Visa PVV, IBM 3624 PIN offset, ARQC/ARPC (Visa and Mastercard) — generate or verify. Software-only — use HSMs in production.
                         </p>
                     </div>
                     <button onClick={onClose} className="text-[#9CA3AF] hover:text-[#111827] p-1"><X size={16} /></button>
@@ -53,6 +54,7 @@ export default function KeyToolsModal({ open, onClose, builderState, onInsertFie
                     {tab === "pvv"  && <PvvTab builderState={builderState} />}
                     {tab === "arqc" && <ArqcTab builderState={builderState} onInsertField={onInsertField} onClose={onClose} />}
                     {tab === "arpc" && <ArpcTab onInsertField={onInsertField} onClose={onClose} />}
+                    {tab === "ibm3624" && <Ibm3624Tab builderState={builderState} />}
                 </div>
             </div>
         </div>
@@ -118,23 +120,33 @@ function CvvTab({ builderState, onInsertField, onClose }) {
     const [svc, setSvc] = useState("101");
     const [cvkA, setCvkA] = useState("0123456789ABCDEF");
     const [cvkB, setCvkB] = useState("FEDCBA9876543210");
+    const [mode, setMode] = useState("generate");
+    const [cvvIn, setCvvIn] = useState("");
+    const [t2Pvki, setT2Pvki] = useState("0");
+    const [t2Pvv, setT2Pvv] = useState("0000");
     const [res, setRes] = useState(null);
+    const [verdict, setVerdict] = useState(null);
     const [busy, setBusy] = useState(false);
 
     const compute = async () => {
         setBusy(true);
         try {
-            const { data } = await api.post("/keys/cvv", {
-                pan, expiry, service_code: svc, cvk_a_hex: cvkA, cvk_b_hex: cvkB,
-            });
-            setRes(data);
+            const body = { pan, expiry, service_code: svc, cvk_a_hex: cvkA, cvk_b_hex: cvkB };
+            if (mode === "verify") {
+                const { data } = await api.post("/keys/cvv/verify", { ...body, cvv: cvvIn });
+                setVerdict(data);
+            } else {
+                const { data } = await api.post("/keys/cvv", body);
+                setRes(data);
+            }
         } catch (e) { toast.error(apiErr(e)); }
         finally { setBusy(false); }
     };
 
     const buildTrack2 = () => {
         if (!res) return;
-        const t2 = `${pan}D${expiry}${svc}000000${res.cvv}0000`;
+        // Visa discretionary data layout: PVKI(1) || PVV(4) || CVV(3) || filler
+        const t2 = `${pan}D${expiry}${svc}${(t2Pvki || "0").slice(0, 1)}${(t2Pvv || "0000").padEnd(4, "0").slice(0, 4)}${res.cvv}000`;
         onInsertField?.(35, t2);
         toast.success("F35 track2 populated");
         onClose?.();
@@ -152,13 +164,24 @@ function CvvTab({ builderState, onInsertField, onClose }) {
                 <Field label="CVK_A (8 bytes hex)"><input data-testid="cvv-cvka" value={cvkA} onChange={(e) => setCvkA(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
                 <Field label="CVK_B (8 bytes hex)"><input data-testid="cvv-cvkb" value={cvkB} onChange={(e) => setCvkB(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
             </div>
-            <button onClick={compute} disabled={busy} data-testid="cvv-compute-btn" className="h-9 px-4 border border-[#002FA7] text-[#002FA7] text-xs font-semibold hover:bg-[#F3F4F6] disabled:opacity-50">
-                {busy ? "Computing…" : "Compute CVV"}
+            <ModeToggle mode={mode} setMode={(m) => { setMode(m); setVerdict(null); }} testid="cvv-mode" />
+            {mode === "verify" && (
+                <Field label="CVV to verify (3 digits)">
+                    <input data-testid="cvv-verify-input" value={cvvIn} maxLength={3} onChange={(e) => setCvvIn(e.target.value.replace(/\D/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
+                </Field>
+            )}
+            <button onClick={compute} disabled={busy || (mode === "verify" && cvvIn.length !== 3)} data-testid="cvv-compute-btn" className="h-9 px-4 border border-[#002FA7] text-[#002FA7] text-xs font-semibold hover:bg-[#F3F4F6] disabled:opacity-50">
+                {busy ? "Working…" : mode === "verify" ? "Verify CVV" : "Compute CVV"}
             </button>
-            {res && (
+            {mode === "verify" && <Verdict data={verdict} what="CVV" kcvLabel="CVK KCV" kcv={verdict?.cvk_kcv} testid="cvv-verdict" />}
+            {mode === "generate" && res && (
                 <div className="border border-[#E5E7EB] bg-[#F9FAFB] p-3 space-y-2 text-xs" data-testid="cvv-result">
                     <ResultLine label="CVV" value={res.cvv} accent testid="cvv-value" />
                     <ResultLine label="CVK KCV" value={res.cvk_kcv} testid="cvv-kcv" />
+                    <div className="grid grid-cols-2 gap-3">
+                        <Field label="Track 2 PVKI (optional)"><input data-testid="cvv-t2-pvki" value={t2Pvki} maxLength={1} onChange={(e) => setT2Pvki(e.target.value.replace(/\D/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
+                        <Field label="Track 2 PVV (optional)"><input data-testid="cvv-t2-pvv" value={t2Pvv} maxLength={4} onChange={(e) => setT2Pvv(e.target.value.replace(/\D/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
+                    </div>
                     <button onClick={buildTrack2} data-testid="cvv-build-track2" className="h-9 px-4 bg-[#002FA7] text-white text-xs font-semibold hover:bg-[#002080] flex items-center gap-2">
                         Build track2 → insert into F35 <ArrowRight size={12} weight="bold" />
                     </button>
@@ -175,36 +198,89 @@ function PvvTab({ builderState }) {
     const [pvki, setPvki] = useState("1");
     const [pvkA, setPvkA] = useState("0123456789ABCDEF");
     const [pvkB, setPvkB] = useState("FEDCBA9876543210");
+    const [mode, setMode] = useState("generate");
+    const [pvvIn, setPvvIn] = useState("");
+    const [source, setSource] = useState("clear"); // clear | block
+    const [block, setBlock] = useState(builderState?.values?.[52] || "");
+    const [pek, setPek] = useState("");
+    const [pinFormat, setPinFormat] = useState("ISO-0");
+    const [pinAlgo, setPinAlgo] = useState("3DES");
     const [res, setRes] = useState(null);
+    const [verdict, setVerdict] = useState(null);
     const [busy, setBusy] = useState(false);
 
     const compute = async () => {
         setBusy(true);
         try {
-            const { data } = await api.post("/keys/pvv", {
-                pan, pin, pvki, pvk_a_hex: pvkA, pvk_b_hex: pvkB,
-            });
-            setRes(data);
+            if (mode === "verify") {
+                const body = { pan, pvki, pvv: pvvIn, pvk_a_hex: pvkA, pvk_b_hex: pvkB };
+                Object.assign(body, source === "block"
+                    ? { pin_block_hex: block, pek_hex: pek, pin_format: pinFormat, pin_algorithm: pinAlgo }
+                    : { pin });
+                const { data } = await api.post("/keys/pvv/verify", body);
+                setVerdict(data);
+            } else {
+                const { data } = await api.post("/keys/pvv", {
+                    pan, pin, pvki, pvk_a_hex: pvkA, pvk_b_hex: pvkB,
+                });
+                setRes(data);
+            }
         } catch (e) { toast.error(apiErr(e)); }
         finally { setBusy(false); }
     };
+    const showClearPin = mode === "generate" || source === "clear";
 
     return (
         <>
             <p className="text-xs text-[#4B5563]">VISA PVV: encrypt (PAN[11] || PVKI || PIN[4]) under PVK pair, take first 4 decimal digits.</p>
             <div className="grid grid-cols-3 gap-3">
                 <Field label="PAN"><input data-testid="pvv-pan" value={pan} onChange={(e) => setPan(e.target.value.replace(/\D/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
-                <Field label="PIN (4 digits)"><input data-testid="pvv-pin" type="password" inputMode="numeric" maxLength={4} value={pin} onChange={(e) => setPin(e.target.value.replace(/\D/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
+                {showClearPin ? (
+                    <Field label="PIN (4 digits)"><input data-testid="pvv-pin" type="password" inputMode="numeric" maxLength={4} value={pin} onChange={(e) => setPin(e.target.value.replace(/\D/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
+                ) : <div />}
                 <Field label="PVKI (1 digit)"><input data-testid="pvv-pvki" value={pvki} maxLength={1} onChange={(e) => setPvki(e.target.value.replace(/\D/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
             </div>
             <div className="grid grid-cols-2 gap-3">
                 <Field label="PVK_A (8 bytes hex)"><input data-testid="pvv-pvka" value={pvkA} onChange={(e) => setPvkA(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
                 <Field label="PVK_B (8 bytes hex)"><input data-testid="pvv-pvkb" value={pvkB} onChange={(e) => setPvkB(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
             </div>
-            <button onClick={compute} disabled={busy} data-testid="pvv-compute-btn" className="h-9 px-4 border border-[#002FA7] text-[#002FA7] text-xs font-semibold hover:bg-[#F3F4F6] disabled:opacity-50">
-                {busy ? "Computing…" : "Compute PVV"}
+            <ModeToggle mode={mode} setMode={(m) => { setMode(m); setVerdict(null); }} testid="pvv-mode" />
+            {mode === "verify" && (
+                <>
+                    <div className="grid grid-cols-2 gap-3">
+                        <Field label="PVV to verify (4 digits)">
+                            <input data-testid="pvv-verify-input" value={pvvIn} maxLength={4} onChange={(e) => setPvvIn(e.target.value.replace(/\D/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
+                        </Field>
+                        <Field label="PIN from">
+                            <select data-testid="pvv-source-select" value={source} onChange={(e) => setSource(e.target.value)} className="w-full h-9 border border-gray-300 px-2 text-sm bg-white">
+                                <option value="clear">Clear PIN</option>
+                                <option value="block">Encrypted PIN block (F52)</option>
+                            </select>
+                        </Field>
+                    </div>
+                    {source === "block" && (
+                        <div className="grid grid-cols-2 gap-3">
+                            <Field label="PIN block (hex)"><input data-testid="pvv-block" value={block} onChange={(e) => setBlock(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
+                            <Field label="PEK / ZPK (hex)"><input data-testid="pvv-pek" value={pek} onChange={(e) => setPek(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
+                            <Field label="PIN block format">
+                                <select data-testid="pvv-format-select" value={pinFormat} onChange={(e) => setPinFormat(e.target.value)} className="w-full h-9 border border-gray-300 px-2 text-sm bg-white">
+                                    <option>ISO-0</option><option>ISO-1</option><option>ISO-3</option>
+                                </select>
+                            </Field>
+                            <Field label="Algorithm">
+                                <select data-testid="pvv-algo-select" value={pinAlgo} onChange={(e) => setPinAlgo(e.target.value)} className="w-full h-9 border border-gray-300 px-2 text-sm bg-white">
+                                    <option>3DES</option><option>AES</option>
+                                </select>
+                            </Field>
+                        </div>
+                    )}
+                </>
+            )}
+            <button onClick={compute} disabled={busy || (mode === "verify" && pvvIn.length !== 4)} data-testid="pvv-compute-btn" className="h-9 px-4 border border-[#002FA7] text-[#002FA7] text-xs font-semibold hover:bg-[#F3F4F6] disabled:opacity-50">
+                {busy ? "Working…" : mode === "verify" ? "Verify PIN against PVV" : "Compute PVV"}
             </button>
-            {res && (
+            {mode === "verify" && <Verdict data={verdict} what="PIN / PVV" kcvLabel="PVK KCV" kcv={verdict?.pvk_kcv} testid="pvv-verdict" />}
+            {mode === "generate" && res && (
                 <div className="border border-[#E5E7EB] bg-[#F9FAFB] p-3 space-y-2 text-xs" data-testid="pvv-result">
                     <ResultLine label="PVV" value={res.pvv} accent testid="pvv-value" />
                     <ResultLine label="PVKI" value={res.pvki} />
@@ -220,15 +296,32 @@ function ArqcTab({ builderState, onInsertField, onClose }) {
     const [mdk, setMdk] = useState("0123456789ABCDEFFEDCBA9876543210");
     const [pan, setPan] = useState(builderState?.values?.[2] || "");
     const [psn, setPsn] = useState("00");
+    const [cvn, setCvn] = useState("CVN10");
+    const [atc, setAtc] = useState("0001");
     const [cdol, setCdol] = useState("");
+    const [un, setUn] = useState("00000000");
+    const [mode, setMode] = useState("generate");
+    const [arqcIn, setArqcIn] = useState("");
+    const needsUn = cvn === "MC_CVN16" || cvn === "MC_CVN17";
     const [res, setRes] = useState(null);
+    const [verdict, setVerdict] = useState(null);
     const [busy, setBusy] = useState(false);
 
     const compute = async () => {
         setBusy(true);
         try {
-            const { data } = await api.post("/keys/arqc", { mdk_hex: mdk, pan, psn, cdol_hex: cdol });
-            setRes(data);
+            const body = {
+                mdk_hex: mdk, pan, psn, cdol_hex: cdol, cvn,
+                atc_hex: cvn === "CVN10" ? null : atc,
+                un_hex: needsUn ? un : null,
+            };
+            if (mode === "verify") {
+                const { data } = await api.post("/keys/arqc/verify", { ...body, arqc_hex: arqcIn });
+                setVerdict(data);
+            } else {
+                const { data } = await api.post("/keys/arqc", body);
+                setRes(data);
+            }
         } catch (e) { toast.error(apiErr(e)); }
         finally { setBusy(false); }
     };
@@ -242,14 +335,43 @@ function ArqcTab({ builderState, onInsertField, onClose }) {
 
     return (
         <>
-            <p className="text-xs text-[#4B5563]">EMV: derive ICC MK from MDK using Method A (PAN || PSN), apply odd parity, then ARQC = retail MAC (ISO/IEC 9797-1 alg 3) over your CDOL bytes.</p>
+            <p className="text-xs text-[#4B5563]">
+                CVN10: ICC MK (Option A) is the MAC key, Visa zero padding.
+                CVN18: ICC MK (Option B) → session key from ATC, EMV 0x80 padding; include the IAD (9F10) at the end of the CDOL data.
+                Mastercard CVN16/17: ICC MK (Option A) → Mastercard session key from ATC + UN (9F37).
+                Mastercard CVN20/21: ICC MK (Option A) → EMV session key from ATC.
+                Mastercard CDOL data = terminal tags + CVR (6 bytes from 9F10); CVN17/21 also append the 8-byte counters.
+                AES: AES ICC MK → session key → AES-CMAC.
+            </p>
             <div className="grid grid-cols-1 gap-3">
-                <Field label="MDK (16 or 24 bytes hex)"><input data-testid="arqc-mdk" value={mdk} onChange={(e) => setMdk(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
+                <Field label={cvn === "AES" ? "MDK (16/24/32 bytes hex)" : "MDK (16 or 24 bytes hex)"}><input data-testid="arqc-mdk" value={mdk} onChange={(e) => setMdk(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
                 <div className="grid grid-cols-3 gap-3">
                     <Field label="PAN"><input data-testid="arqc-pan" value={pan} onChange={(e) => setPan(e.target.value.replace(/\D/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
                     <Field label="PSN"><input data-testid="arqc-psn" value={psn} maxLength={2} onChange={(e) => setPsn(e.target.value.replace(/\D/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
-                    <div />
+                    <Field label="CVN">
+                        <select data-testid="arqc-cvn-select" value={cvn} onChange={(e) => setCvn(e.target.value)} className="w-full h-9 border border-gray-300 px-2 text-sm bg-white">
+                            <option value="CVN10">Visa CVN10</option>
+                            <option value="CVN18">Visa CVN18</option>
+                            <option value="MC_CVN16">Mastercard CVN16</option>
+                            <option value="MC_CVN17">Mastercard CVN17</option>
+                            <option value="MC_CVN20">Mastercard CVN20</option>
+                            <option value="MC_CVN21">Mastercard CVN21</option>
+                            <option value="AES">AES</option>
+                        </select>
+                    </Field>
                 </div>
+                {cvn !== "CVN10" && (
+                    <div className="grid grid-cols-2 gap-3">
+                        <Field label="ATC (9F36, 2 bytes hex)">
+                            <input data-testid="arqc-atc" value={atc} maxLength={4} onChange={(e) => setAtc(e.target.value.toUpperCase().replace(/[^0-9A-F]/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
+                        </Field>
+                        {needsUn ? (
+                            <Field label="Unpredictable number (9F37, 4 bytes hex)">
+                                <input data-testid="arqc-un" value={un} maxLength={8} onChange={(e) => setUn(e.target.value.toUpperCase().replace(/[^0-9A-F]/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
+                            </Field>
+                        ) : <div />}
+                    </div>
+                )}
                 <Field label="CDOL data (hex; concatenation per CDOL1)">
                     <textarea
                         data-testid="arqc-cdol"
@@ -261,15 +383,34 @@ function ArqcTab({ builderState, onInsertField, onClose }) {
                     />
                 </Field>
             </div>
-            <button onClick={compute} disabled={busy} data-testid="arqc-compute-btn" className="h-9 px-4 border border-[#002FA7] text-[#002FA7] text-xs font-semibold hover:bg-[#F3F4F6] disabled:opacity-50">
-                {busy ? "Computing…" : "Compute ARQC"}
+            <ModeToggle mode={mode} setMode={(m) => { setMode(m); setVerdict(null); }} testid="arqc-mode" />
+            {mode === "verify" && (
+                <Field label="ARQC to verify (9F26, 8 bytes hex)">
+                    <input data-testid="arqc-verify-input" value={arqcIn} maxLength={16} onChange={(e) => setArqcIn(e.target.value.toUpperCase().replace(/[^0-9A-F]/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
+                </Field>
+            )}
+            <button onClick={compute} disabled={busy || (mode === "verify" && arqcIn.length !== 16)} data-testid="arqc-compute-btn" className="h-9 px-4 border border-[#002FA7] text-[#002FA7] text-xs font-semibold hover:bg-[#F3F4F6] disabled:opacity-50">
+                {busy ? "Working…" : mode === "verify" ? "Verify ARQC" : "Compute ARQC"}
             </button>
-            {res && (
+            {mode === "verify" && (
+                <Verdict data={verdict} what="ARQC" kcvLabel="Session key KCV" kcv={verdict?.session_key_kcv} testid="arqc-verdict">
+                    {verdict?.valid && verdict.arpc_key_hex && (
+                        <ResultLine label={`ARPC key (Method ${verdict.arpc_method})`} value={verdict.arpc_key_hex} testid="arqc-verdict-sk" />
+                    )}
+                </Verdict>
+            )}
+            {mode === "generate" && res && (
                 <div className="border border-[#E5E7EB] bg-[#F9FAFB] p-3 space-y-2 text-xs" data-testid="arqc-result">
                     <ResultLine label="MDK KCV"     value={res.mdk_kcv} testid="arqc-mdk-kcv" />
                     <ResultLine label="ICC MK"      value={res.icc_mk_hex} testid="arqc-icc-mk" />
                     <ResultLine label="ICC MK KCV"  value={res.icc_mk_kcv} testid="arqc-icc-kcv" />
+                    {res.session_key_hex !== res.icc_mk_hex && (
+                        <ResultLine label="Session key" value={res.session_key_hex} testid="arqc-sk" />
+                    )}
                     <ResultLine label="ARQC"        value={res.arqc_hex} accent testid="arqc-value" />
+                    {res.arpc_key_hex && (
+                        <ResultLine label={`ARPC key (Method ${res.arpc_method})`} value={res.arpc_key_hex} testid="arqc-arpc-key" />
+                    )}
                     <ResultLine label="F55 TLV"     value={res.f55_tlv_hex} testid="arqc-f55-tlv" />
                     <button onClick={insertF55} data-testid="arqc-insert-f55" className="h-9 px-4 bg-[#002FA7] text-white text-xs font-semibold hover:bg-[#002080] flex items-center gap-2">
                         Insert as F55 (9F26 ARQC) <ArrowRight size={12} weight="bold" />
@@ -286,15 +427,18 @@ function ArpcTab({ onInsertField, onClose }) {
     const [arqc, setArqc] = useState("");
     const [arc, setArc] = useState("3030");
     const [algo, setAlgo] = useState("3DES");
+    const [method, setMethod] = useState(1);
+    const [csu, setCsu] = useState("00000000");
+    const [pad, setPad] = useState("");
     const [res, setRes] = useState(null);
     const [busy, setBusy] = useState(false);
 
     const compute = async () => {
         setBusy(true);
         try {
-            const { data } = await api.post("/keys/arpc", {
-                sk_hex: sk, arqc_hex: arqc, arc_hex: arc, algorithm: algo,
-            });
+            const { data } = await api.post("/keys/arpc", method === 2
+                ? { sk_hex: sk, arqc_hex: arqc, algorithm: "3DES", method: 2, csu_hex: csu, pad_hex: pad }
+                : { sk_hex: sk, arqc_hex: arqc, arc_hex: arc, algorithm: algo, method: 1 });
             setRes(data);
         } catch (e) { toast.error(apiErr(e)); }
         finally { setBusy(false); }
@@ -303,20 +447,27 @@ function ArpcTab({ onInsertField, onClose }) {
     const insertF55 = () => {
         if (!res) return;
         onInsertField?.(55, res.f55_tlv_hex);
-        toast.success("F55 populated with 91 IAD (ARPC || ARC)");
+        toast.success(method === 2 ? "F55 populated with 91 IAD (ARPC || CSU)" : "F55 populated with 91 IAD (ARPC || ARC)");
         onClose?.();
     };
 
     return (
         <>
             <p className="text-xs text-[#4B5563]">
-                Issuer ARPC (Method 1): <code className="font-mono">encrypt(SK, ARQC XOR (ARC || 00…))</code>.
-                Paste the session key (SK_AC) — usually derived from MDK on the issuer side — plus the ARQC the
-                terminal sent and a 2-byte authorisation response code (ARC). 3030 = ASCII "00" = approved.
+                Method 1 (Visa CVN10, M/Chip): <code className="font-mono">encrypt(SK, ARQC XOR (ARC || 00…))</code>, tag 91 = ARPC || ARC.
+                Method 2 (Visa CVN18): <code className="font-mono">MAC(SK, ARQC || CSU || PAD)</code>, 4 bytes, tag 91 = ARPC || CSU || PAD.
+                Paste the key the ARQC tab shows as "ARPC key", and use the method shown there: Mastercard CVN16/17
+                answer under the ICC MK, CVN20/21 and Visa CVN18 under the session key.
             </p>
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-4 gap-3">
+                <Field label="Method">
+                    <select data-testid="arpc-method-select" value={method} onChange={(e) => { const m = Number(e.target.value); setMethod(m); if (m === 2) setAlgo("3DES"); }} className="w-full h-9 border border-gray-300 px-2 text-sm bg-white">
+                        <option value={1}>Method 1</option>
+                        <option value={2}>Method 2</option>
+                    </select>
+                </Field>
                 <Field label="Algorithm">
-                    <select data-testid="arpc-algo-select" value={algo} onChange={(e) => setAlgo(e.target.value)} className="w-full h-9 border border-gray-300 px-2 text-sm bg-white">
+                    <select data-testid="arpc-algo-select" value={algo} disabled={method === 2} onChange={(e) => setAlgo(e.target.value)} className="w-full h-9 border border-gray-300 px-2 text-sm bg-white disabled:bg-gray-100">
                         <option value="3DES">3DES</option>
                         <option value="AES">AES</option>
                     </select>
@@ -331,17 +482,29 @@ function ArpcTab({ onInsertField, onClose }) {
                 <Field label="ARQC (8 bytes hex for 3DES)">
                     <input data-testid="arpc-arqc" value={arqc} onChange={(e) => setArqc(e.target.value.toUpperCase())} placeholder="e.g. 1A2B3C4D5E6F7081" className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
                 </Field>
-                <Field label="ARC (2 bytes hex; '3030' = '00' approved)">
-                    <input data-testid="arpc-arc" value={arc} maxLength={4} onChange={(e) => setArc(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
-                </Field>
+                {method === 1 ? (
+                    <Field label="ARC (2 bytes hex; '3030' = '00' approved)">
+                        <input data-testid="arpc-arc" value={arc} maxLength={4} onChange={(e) => setArc(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
+                    </Field>
+                ) : (
+                    <Field label="CSU (4 bytes hex, Card Status Update)">
+                        <input data-testid="arpc-csu" value={csu} maxLength={8} onChange={(e) => setCsu(e.target.value.toUpperCase().replace(/[^0-9A-F]/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
+                    </Field>
+                )}
             </div>
+            {method === 2 && (
+                <Field label="Proprietary Auth Data (optional, 0-8 bytes hex)">
+                    <input data-testid="arpc-pad" value={pad} maxLength={16} onChange={(e) => setPad(e.target.value.toUpperCase().replace(/[^0-9A-F]/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" />
+                </Field>
+            )}
             <button onClick={compute} disabled={busy || !arqc} data-testid="arpc-compute-btn" className="h-9 px-4 border border-[#002FA7] text-[#002FA7] text-xs font-semibold hover:bg-[#F3F4F6] disabled:opacity-50">
                 {busy ? "Computing…" : "Compute ARPC"}
             </button>
             {res && (
                 <div className="border border-[#E5E7EB] bg-[#F9FAFB] p-3 space-y-2 text-xs" data-testid="arpc-result">
                     <ResultLine label="ARPC"        value={res.arpc_hex}        accent testid="arpc-value" />
-                    <ResultLine label="ARC"         value={res.arc_hex}                testid="arpc-arc-out" />
+                    {res.arc_hex && <ResultLine label="ARC" value={res.arc_hex} testid="arpc-arc-out" />}
+                    {res.csu_hex && <ResultLine label="CSU" value={res.csu_hex} testid="arpc-csu-out" />}
                     <ResultLine label="SK KCV"      value={res.session_key_kcv}        testid="arpc-sk-kcv" />
                     <ResultLine label="F55 TLV"     value={res.f55_tlv_hex}            testid="arpc-f55-tlv" />
                     <button onClick={insertF55} data-testid="arpc-insert-f55" className="h-9 px-4 bg-[#002FA7] text-white text-xs font-semibold hover:bg-[#002080] flex items-center gap-2">
@@ -353,7 +516,140 @@ function ArpcTab({ onInsertField, onClose }) {
     );
 }
 
+// ----------------------------- IBM 3624 ---------------------------------
+function Ibm3624Tab({ builderState }) {
+    const [pan, setPan] = useState(builderState?.values?.[2] || "");
+    const [pvk, setPvk] = useState("0123456789ABCDEFFEDCBA9876543210");
+    const [table, setTable] = useState("0123456789012345");
+    const [vOffset, setVOffset] = useState("0");
+    const [vLength, setVLength] = useState("");
+    const [pad, setPad] = useState("F");
+    const [mode, setMode] = useState("generate");
+    const [pin, setPin] = useState("");
+    const [offsetIn, setOffsetIn] = useState("");
+    const [source, setSource] = useState("clear");
+    const [block, setBlock] = useState(builderState?.values?.[52] || "");
+    const [pek, setPek] = useState("");
+    const [pinFormat, setPinFormat] = useState("ISO-0");
+    const [res, setRes] = useState(null);
+    const [verdict, setVerdict] = useState(null);
+    const [busy, setBusy] = useState(false);
+
+    const compute = async () => {
+        setBusy(true);
+        try {
+            const base = {
+                pan, pvk_hex: pvk, decimalization_table: table, pad,
+                verify_offset: Number(vOffset || 0),
+                verify_length: vLength ? Number(vLength) : null,
+            };
+            if (mode === "verify") {
+                const body = { ...base, offset: offsetIn };
+                Object.assign(body, source === "block"
+                    ? { pin_block_hex: block, pek_hex: pek, pin_format: pinFormat }
+                    : { pin });
+                const { data } = await api.post("/keys/ibm3624/verify", body);
+                setVerdict(data);
+            } else {
+                const { data } = await api.post("/keys/ibm3624", { ...base, pin });
+                setRes(data);
+            }
+        } catch (e) { toast.error(apiErr(e)); }
+        finally { setBusy(false); }
+    };
+    const showClearPin = mode === "generate" || source === "clear";
+
+    return (
+        <>
+            <p className="text-xs text-[#4B5563]">
+                IBM 3624: natural PIN = decimalise(3DES_PVK(validation data)); offset = PIN − natural PIN (mod 10, per digit).
+                Validation data = PAN digits from the offset/length below, right-padded to 16 with the pad character.
+                Common with Mastercard and many other issuers.
+            </p>
+            <div className="grid grid-cols-2 gap-3">
+                <Field label="PAN"><input data-testid="ibm-pan" value={pan} onChange={(e) => setPan(e.target.value.replace(/\D/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
+                <Field label="PVK (8/16/24 bytes hex)"><input data-testid="ibm-pvk" value={pvk} onChange={(e) => setPvk(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
+            </div>
+            <div className="grid grid-cols-4 gap-3">
+                <Field label="Decimalisation table"><input data-testid="ibm-table" value={table} maxLength={16} onChange={(e) => setTable(e.target.value.replace(/\D/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
+                <Field label="Validation offset"><input data-testid="ibm-voffset" value={vOffset} onChange={(e) => setVOffset(e.target.value.replace(/\D/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
+                <Field label="Validation length"><input data-testid="ibm-vlength" value={vLength} placeholder="rest of PAN" onChange={(e) => setVLength(e.target.value.replace(/\D/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
+                <Field label="Pad"><input data-testid="ibm-pad" value={pad} maxLength={1} onChange={(e) => setPad(e.target.value.toUpperCase().replace(/[^0-9A-F]/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
+            </div>
+            <ModeToggle mode={mode} setMode={(m) => { setMode(m); setVerdict(null); }} testid="ibm-mode" />
+            <div className="grid grid-cols-2 gap-3">
+                {showClearPin && (
+                    <Field label="PIN (4-12 digits)"><input data-testid="ibm-pin" type="password" inputMode="numeric" maxLength={12} value={pin} onChange={(e) => setPin(e.target.value.replace(/\D/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
+                )}
+                {mode === "verify" && (
+                    <>
+                        <Field label="Offset to verify"><input data-testid="ibm-offset-input" value={offsetIn} maxLength={12} onChange={(e) => setOffsetIn(e.target.value.replace(/\D/g, ""))} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
+                        <Field label="PIN from">
+                            <select data-testid="ibm-source-select" value={source} onChange={(e) => setSource(e.target.value)} className="w-full h-9 border border-gray-300 px-2 text-sm bg-white">
+                                <option value="clear">Clear PIN</option>
+                                <option value="block">Encrypted PIN block (F52)</option>
+                            </select>
+                        </Field>
+                    </>
+                )}
+            </div>
+            {mode === "verify" && source === "block" && (
+                <div className="grid grid-cols-3 gap-3">
+                    <Field label="PIN block (hex)"><input data-testid="ibm-block" value={block} onChange={(e) => setBlock(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
+                    <Field label="PEK / ZPK (hex)"><input data-testid="ibm-pek" value={pek} onChange={(e) => setPek(e.target.value.toUpperCase())} className="w-full h-9 border border-gray-300 px-2 text-sm font-mono" /></Field>
+                    <Field label="PIN block format">
+                        <select data-testid="ibm-format-select" value={pinFormat} onChange={(e) => setPinFormat(e.target.value)} className="w-full h-9 border border-gray-300 px-2 text-sm bg-white">
+                            <option>ISO-0</option><option>ISO-1</option><option>ISO-3</option>
+                        </select>
+                    </Field>
+                </div>
+            )}
+            <button onClick={compute} disabled={busy || (mode === "verify" && offsetIn.length < 4)} data-testid="ibm-compute-btn" className="h-9 px-4 border border-[#002FA7] text-[#002FA7] text-xs font-semibold hover:bg-[#F3F4F6] disabled:opacity-50">
+                {busy ? "Working…" : mode === "verify" ? "Verify PIN against offset" : "Compute offset"}
+            </button>
+            {mode === "verify" && <Verdict data={verdict} what="PIN / offset" kcvLabel="PVK KCV" kcv={verdict?.pvk_kcv} testid="ibm-verdict" />}
+            {mode === "generate" && res && (
+                <div className="border border-[#E5E7EB] bg-[#F9FAFB] p-3 space-y-2 text-xs" data-testid="ibm-result">
+                    <ResultLine label="PIN offset" value={res.offset} accent testid="ibm-offset-value" />
+                    <ResultLine label="PVK KCV" value={res.pvk_kcv} testid="ibm-kcv" />
+                </div>
+            )}
+        </>
+    );
+}
+
 // ----------------------------- shared ------------------------------------
+const ModeToggle = ({ mode, setMode, testid }) => (
+    <div className="inline-flex border border-gray-300" data-testid={testid}>
+        {["generate", "verify"].map((m) => (
+            <button
+                key={m}
+                type="button"
+                onClick={() => setMode(m)}
+                data-testid={`${testid}-${m}`}
+                className={`h-8 px-4 text-xs font-semibold capitalize ${mode === m ? "bg-[#002FA7] text-white" : "text-[#4B5563] hover:bg-gray-50"}`}
+            >
+                {m}
+            </button>
+        ))}
+    </div>
+);
+
+const Verdict = ({ data, what, kcvLabel, kcv, testid, children }) => {
+    if (!data) return null;
+    const ok = data.valid === true;
+    return (
+        <div className={`border p-3 space-y-2 text-xs ${ok ? "border-[#16A34A] bg-[#F0FDF4]" : "border-[#E11D48] bg-[#FFF1F2]"}`} data-testid={testid}>
+            <div className={`flex items-center gap-2 font-semibold ${ok ? "text-[#16A34A]" : "text-[#E11D48]"}`}>
+                {ok ? <CheckCircle size={14} weight="fill" /> : <XCircle size={14} weight="fill" />}
+                {what} {ok ? "verified" : "does not match"}
+            </div>
+            {kcv && <ResultLine label={kcvLabel} value={kcv} />}
+            {children}
+        </div>
+    );
+};
+
 const Field = ({ label, children }) => (
     <label className="block">
         <div className="text-[10px] uppercase tracking-widest text-[#4B5563] mb-1">{label}</div>
