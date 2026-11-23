@@ -9,7 +9,7 @@ import asyncio
 import hmac
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 
 import bcrypt
 import jwt
@@ -39,6 +39,7 @@ from iso8583 import (
 )
 from samples import SAMPLES
 from tcp_transport import send_over_tcp, LENGTH_HEADERS
+from net_probe import probe_tcp, normalise_host, host_port_from_ws_url
 from pin_crypto import encrypt_pin_block, decrypt_pin_block, PIN_FORMATS, PIN_ALGORITHMS
 from key_management import (
     compute_kcv, compute_cvv, compute_pvv,
@@ -220,6 +221,28 @@ class ConnectionProfileIn(BaseModel):
     heartbeat_interval_sec: int = 30
     wire_format: str = "native"        # "native" | "ascii"
     description: Optional[str] = None
+
+
+class ProbeRequest(BaseModel):
+    """Ad-hoc telnet-style test. `host` may include the port ("10.0.0.5:8583")."""
+    host: str
+    port: Optional[int] = Field(default=None, ge=1, le=65535)
+    use_tls: bool = False
+    timeout_sec: float = Field(default=5.0, gt=0, le=30)
+
+
+def _validated_tcp_target(body: "ConnectionProfileIn") -> Tuple[str, int]:
+    """Normalise host/IP for a TCP profile; a port pasted into the host field fills an empty port."""
+    try:
+        host, pasted = normalise_host(body.host or "")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    port = body.port or pasted
+    if not port:
+        raise HTTPException(status_code=400, detail="TCP profiles require host and port")
+    if pasted and body.port and pasted != body.port:
+        raise HTTPException(status_code=400, detail=f"Host says port {pasted} but the port field says {body.port}.")
+    return host, port
 
 
 class TcpSendRequest(BaseModel):
@@ -1388,8 +1411,8 @@ async def create_connection(body: ConnectionProfileIn, user=Depends(get_current_
         raise HTTPException(status_code=400, detail=f"length_header must be one of {LENGTH_HEADERS}")
     if body.transport not in ("tcp", "websocket"):
         raise HTTPException(status_code=400, detail="transport must be 'tcp' or 'websocket'")
-    if body.transport == "tcp" and not (body.host and body.port):
-        raise HTTPException(status_code=400, detail="TCP profiles require host and port")
+    if body.transport == "tcp":
+        body.host, body.port = _validated_tcp_target(body)
     if body.transport == "websocket" and not body.ws_url:
         raise HTTPException(status_code=400, detail="WebSocket profiles require ws_url")
     if body.length_header not in LENGTH_HEADERS:
@@ -1427,6 +1450,8 @@ async def create_connection(body: ConnectionProfileIn, user=Depends(get_current_
 async def update_connection(conn_id: str, body: ConnectionProfileIn, user=Depends(get_current_user)):
     if body.length_header not in LENGTH_HEADERS:
         raise HTTPException(status_code=400, detail=f"length_header must be one of {LENGTH_HEADERS}")
+    if body.transport == "tcp":
+        body.host, body.port = _validated_tcp_target(body)
     update = {
         "name": body.name,
         "transport": body.transport,
@@ -1467,6 +1492,38 @@ async def delete_connection(conn_id: str, user=Depends(get_current_user)):
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Connection profile not found")
     return {"ok": True}
+
+
+@api.post("/connections/probe")
+async def connection_probe_adhoc(body: ProbeRequest, _user=Depends(get_current_user)):
+    """Telnet-style reachability test for any host:port, before saving a profile.
+    Sends no data; reports DNS, TCP, optional TLS and any greeting."""
+    try:
+        host, pasted = normalise_host(body.host)
+        port = body.port or pasted
+        if not port:
+            raise ValueError("Port is required.")
+        return await probe_tcp(host, port, body.use_tls, body.timeout_sec)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@api.post("/connections/{conn_id}/probe")
+async def connection_probe(conn_id: str, user=Depends(get_current_user)):
+    """Telnet-style reachability test for a saved profile (TCP host:port, or the
+    host:port underneath a ws:// / wss:// URL). Does not touch the live session."""
+    profile = await db.connection_profiles.find_one({"id": conn_id, "user_id": user["id"]}, {"_id": 0})
+    if not profile:
+        raise HTTPException(status_code=404, detail="Connection profile not found")
+    timeout = min(float(profile.get("timeout_sec") or 5.0), 30.0)
+    try:
+        if profile.get("transport") == "websocket":
+            host, port, tls = host_port_from_ws_url(profile.get("ws_url", ""))
+        else:
+            host, port, tls = profile.get("host", ""), int(profile.get("port") or 0), bool(profile.get("use_tls"))
+        return await probe_tcp(host, port, tls, timeout)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @api.post("/connections/{conn_id}/connect")
