@@ -1,0 +1,26 @@
+# Render Blueprint: one Docker web service serving the API and the React app.
+# Secrets marked `sync: false` are entered in the Render dashboard, never committed.
+services:
+  - type: web
+    name: payment-tool
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    region: singapore
+    # Free instances sleep after ~15 min idle, which drops persistent TCP
+    # sessions and heartbeats to switches. Use starter or above for that.
+    plan: free
+    branch: main
+    autoDeploy: true
+    healthCheckPath: /api/
+    envVars:
+      - key: MONGO_URL          # e.g. a MongoDB Atlas connection string
+        sync: false
+      - key: DB_NAME
+        value: payment_tool
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD     # the seeded admin; the code default is insecure
+        sync: false
